@@ -1,6 +1,8 @@
 package main
 
 import (
+	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -71,6 +73,11 @@ func isLocalIP(ip string) bool {
 	return false
 }
 
+// supportsCompression checks if client accepts gzip compression
+func supportsCompression(acceptEncoding string) bool {
+	return strings.Contains(strings.ToLower(acceptEncoding), "gzip")
+}
+
 // checkNixConfig checks if peernix is configured as a substituter
 func checkNixConfig() {
 	substituterURL := fmt.Sprintf("http://localhost:%s/nix-cache/", httpPort)
@@ -135,6 +142,7 @@ func main() {
 	go udpServer()
 	http.HandleFunc("/", handleRoot)
 	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/nix-cache/nix-cache-info", handleNixCacheInfo)
 	http.HandleFunc("/nix-cache/", handleNixCache)
 	
 	log.Printf("[INFO] " + "HTTP server starting on :" + httpPort)
@@ -154,9 +162,18 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("peernix server running\n"))
 }
 
+func handleNixCacheInfo(w http.ResponseWriter, r *http.Request) {
+	// Nix binary cache info endpoint - required by Nix protocol
+	w.Header().Set("Content-Type", "text/x-nix-cache-info")
+	fmt.Fprintf(w, "StoreDir: /nix/store\n")
+	fmt.Fprintf(w, "WantMassQuery: 0\n")
+	fmt.Fprintf(w, "Priority: 50\n")
+	log.Printf("[DEBUG] Served nix-cache-info to %s", r.RemoteAddr)
+}
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	// Calculate average latency
-	metrics.RequestMux.RLock()
+	// Calculate average latency and trim request times
+	metrics.RequestMux.Lock()
 	var avgLatency time.Duration
 	if len(metrics.RequestTimes) > 0 {
 		var total time.Duration
@@ -164,12 +181,13 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 			total += t
 		}
 		avgLatency = total / time.Duration(len(metrics.RequestTimes))
+		
+		// Keep only last 1000 request times (now safe under write lock)
+		if len(metrics.RequestTimes) > 1000 {
+			metrics.RequestTimes = metrics.RequestTimes[len(metrics.RequestTimes)-1000:]
+		}
 	}
-	// Keep only last 1000 request times
-	if len(metrics.RequestTimes) > 1000 {
-		metrics.RequestTimes = metrics.RequestTimes[len(metrics.RequestTimes)-1000:]
-	}
-	metrics.RequestMux.RUnlock()
+	metrics.RequestMux.Unlock()
 	
 	// Get peer count
 	peersMux.RLock()
@@ -236,28 +254,30 @@ func udpServer() {
 			log.Printf("[WARN] " + fmt.Sprintf("UDP read error: %v", err))
 			continue
 		}
-		msg := string(buf[:n])
 		
-		if strings.HasPrefix(msg, "has_path?") {
-			hash := strings.TrimPrefix(msg, "has_path?")
-			log.Printf("[DEBUG] " + fmt.Sprintf("Received path query from %s for hash: %s", addr, hash))
-			if hasPath(hash) {
-				log.Printf("[INFO] " + fmt.Sprintf("Responding YES to %s for hash: %s", addr, hash))
-				conn.WriteToUDP([]byte("yes"), addr)
+		// Handle each message concurrently to prevent blocking
+		go func(msg string, addr *net.UDPAddr) {
+			if strings.HasPrefix(msg, "has_path?") {
+				hash := strings.TrimPrefix(msg, "has_path?")
+				log.Printf("[DEBUG] " + fmt.Sprintf("Received path query from %s for hash: %s", addr, hash))
+				if hasPath(hash) {
+					log.Printf("[INFO] " + fmt.Sprintf("Responding YES to %s for hash: %s", addr, hash))
+					conn.WriteToUDP([]byte("yes"), addr)
+				} else {
+					log.Printf("[DEBUG] " + fmt.Sprintf("Path not found locally: %s", hash))
+				}
+			} else if msg == "ping" {
+				// Don't respond to our own pings
+				if isLocalIP(addr.IP.String()) {
+					log.Printf("[DEBUG] " + fmt.Sprintf("Ignoring ping from self (%s)", addr))
+				} else {
+					log.Printf("[DEBUG] " + fmt.Sprintf("Received ping from %s, sending pong", addr))
+					conn.WriteToUDP([]byte("pong"), addr)
+				}
 			} else {
-				log.Printf("[DEBUG] " + fmt.Sprintf("Path not found locally: %s", hash))
+				log.Printf("[DEBUG] " + fmt.Sprintf("Unknown UDP message from %s: %s", addr, msg))
 			}
-		} else if msg == "ping" {
-			// Don't respond to our own pings
-			if isLocalIP(addr.IP.String()) {
-				log.Printf("[DEBUG] " + fmt.Sprintf("Ignoring ping from self (%s)", addr))
-			} else {
-				log.Printf("[DEBUG] " + fmt.Sprintf("Received ping from %s, sending pong", addr))
-				conn.WriteToUDP([]byte("pong"), addr)
-			}
-		} else {
-			log.Printf("[DEBUG] " + fmt.Sprintf("Unknown UDP message from %s: %s", addr, msg))
-		}
+		}(string(buf[:n]), addr)
 	}
 }
 
@@ -335,29 +355,76 @@ func hasPath(hash string) bool {
 	return false
 }
 
-func generateNarInfo(hash string, w io.Writer) error {
+func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	fullPath, found := findStorePath(hash)
 	if !found {
 		return fmt.Errorf("store path not found for hash: %s", hash)
 	}
 	
+	// Get all required info from nix-store
 	cmd := exec.Command("nix-store", "--query", "--requisites", fullPath)
 	refs, err := cmd.Output()
 	if err != nil {
 		return err
 	}
+	
 	cmd = exec.Command("nix-store", "--query", "--deriver", fullPath)
 	deriver, err := cmd.Output()
 	if err != nil {
 		return err
 	}
+	
 	cmd = exec.Command("nix-store", "--query", "--size", fullPath)
 	size, err := cmd.Output()
 	if err != nil {
 		return err
 	}
-
+	
+	// Get NAR hash from nix-store
+	cmd = exec.Command("nix-store", "--query", "--hash", fullPath)
+	narHashOutput, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+	narHash := strings.TrimSpace(string(narHashOutput))
+	
+	// For uncompressed NAR, FileHash = NarHash and FileSize = NarSize
+	fileHash := narHash
+	fileSize := strings.TrimSpace(string(size))
+	
+	// Complete narinfo format with all required fields
 	_, err = w.Write([]byte("StorePath: " + fullPath + "\n"))
+	if err != nil {
+		return err
+	}
+	url := hash + ".nar"
+	compression := "none"
+	if compress {
+		url += ".gz"
+		compression = "gzip"
+	}
+	
+	_, err = w.Write([]byte("URL: " + url + "\n"))
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte("Compression: " + compression + "\n"))
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte("FileHash: " + fileHash + "\n"))
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte("FileSize: " + fileSize + "\n"))
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte("NarHash: " + narHash + "\n"))
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte("NarSize: " + strings.TrimSpace(string(size)) + "\n"))
 	if err != nil {
 		return err
 	}
@@ -366,20 +433,104 @@ func generateNarInfo(hash string, w io.Writer) error {
 		return err
 	}
 	_, err = w.Write([]byte("Deriver: " + string(deriver) + "\n"))
-	if err != nil {
-		return err
-	}
-	_, err = w.Write([]byte("NarSize: " + string(size) + "\n"))
 	return err
 }
 
-func generateNar(hash string, w io.Writer) error {
+// queryPeersParallel queries all known peers in parallel for a hash
+func queryPeersParallel(hash string) *net.UDPAddr {
+	peersMux.RLock()
+	if len(peers) == 0 {
+		peersMux.RUnlock()
+		return nil
+	}
+	
+	// Create a copy of peers to avoid holding lock during network operations
+	currentPeers := make([]Peer, len(peers))
+	copy(currentPeers, peers)
+	peersMux.RUnlock()
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	
+	type result struct {
+		addr *net.UDPAddr
+		err  error
+	}
+	
+	results := make(chan result, len(currentPeers))
+	
+	// Query each peer concurrently
+	for _, peer := range currentPeers {
+		go func(peerAddr string) {
+			defer func() {
+				if r := recover(); r != nil {
+					results <- result{nil, fmt.Errorf("panic in peer query: %v", r)}
+				}
+			}()
+			
+			addr, err := net.ResolveUDPAddr("udp", peerAddr+":"+udpPort)
+			if err != nil {
+				results <- result{nil, err}
+				return
+			}
+			
+			conn, err := net.DialUDP("udp", nil, addr)
+			if err != nil {
+				results <- result{nil, err}
+				return
+			}
+			defer conn.Close()
+			
+			conn.SetDeadline(time.Now().Add(1 * time.Second))
+			conn.Write([]byte("has_path?" + hash))
+			
+			buf := make([]byte, 1024)
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				results <- result{nil, err}
+				return
+			}
+			
+			if string(buf[:n]) == "yes" {
+				results <- result{addr, nil}
+			} else {
+				results <- result{nil, fmt.Errorf("peer doesn't have path")}
+			}
+		}(peer.Addr)
+	}
+	
+	// Wait for first success or all failures
+	for i := 0; i < len(currentPeers); i++ {
+		select {
+		case res := <-results:
+			if res.err == nil {
+				log.Printf("[INFO] Found %s at peer %s via parallel query", hash, res.addr.IP.String())
+				return res.addr
+			}
+		case <-ctx.Done():
+			log.Printf("[DEBUG] Peer query timeout for hash %s", hash)
+			return nil
+		}
+	}
+	
+	return nil
+}
+
+func generateNar(hash string, w io.Writer, compress bool) error {
 	fullPath, found := findStorePath(hash)
 	if !found {
 		return fmt.Errorf("store path not found for hash: %s", hash)
 	}
+	
+	var writer io.Writer = w
+	if compress {
+		gw := gzip.NewWriter(w)
+		defer gw.Close()
+		writer = gw
+	}
+	
 	cmd := exec.Command("nix-store", "--dump", fullPath)
-	cmd.Stdout = w
+	cmd.Stdout = writer
 	return cmd.Run()
 }
 
@@ -425,13 +576,16 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 		metrics.RequestMux.Unlock()
 	}()
 
+	// Check if client supports compression
+	compress := supportsCompression(r.Header.Get("Accept-Encoding")) && isNar
+	
 	// Check local store first
 	if hasPath(hash) {
 		metrics.Hits.Add(1)
 		log.Printf("[INFO] " + fmt.Sprintf("Serving %s from local store", path))
 		if isNarInfo {
 			cw.Header().Set("Content-Type", "text/x-nix-narinfo")
-			err := generateNarInfo(hash, cw)
+			err := generateNarInfo(hash, cw, compress)
 			if err != nil {
 				log.Printf("[ERROR] " + fmt.Sprintf("Failed to generate narinfo for %s: %v", hash, err))
 				http.Error(cw, err.Error(), 500)
@@ -441,77 +595,64 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			cw.Header().Set("Content-Type", "application/x-nix-nar")
-			err := generateNar(hash, cw)
+			if compress {
+				cw.Header().Set("Content-Encoding", "gzip")
+				log.Printf("[DEBUG] " + fmt.Sprintf("Compressing NAR for %s", hash))
+			}
+			err := generateNar(hash, cw, compress)
 			if err != nil {
 				log.Printf("[ERROR] " + fmt.Sprintf("Failed to generate nar for %s: %v", hash, err))
 				http.Error(cw, err.Error(), 500)
 			} else {
 				metrics.FilesSent.Add(1)
 				metrics.BytesSent.Add(uint64(cw.bytes))
+				if compress {
+					log.Printf("[INFO] " + fmt.Sprintf("Served compressed NAR for %s (%d bytes)", hash, cw.bytes))
+				}
 			}
 		}
 		return
 	}
 
-	// Query peers
+	// Query peers in parallel
 	log.Printf("[INFO] " + fmt.Sprintf("Querying peers for %s", path))
-	addr, err := net.ResolveUDPAddr("udp", "255.255.255.255:"+udpPort)
-	if err != nil {
-		log.Printf("[ERROR] " + fmt.Sprintf("Failed to resolve UDP address: %v", err))
-		http.Error(w, "Internal error", 500)
+	peerAddr := queryPeersParallel(hash)
+	if peerAddr == nil {
+		metrics.Misses.Add(1)
+		log.Printf("[INFO] " + fmt.Sprintf("No peers responded for %s", path))
+		http.Error(cw, "Not found in local store or peers", 404)
 		return
 	}
 	
-	conn, err := net.DialUDP("udp", nil, addr)
+	// Fetch from the peer that responded
+	peerURL := "http://" + peerAddr.IP.String() + ":" + httpPort + r.URL.Path
+	log.Printf("[INFO] " + fmt.Sprintf("Found %s at peer %s, fetching from %s", path, peerAddr.IP, peerURL))
+	
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(peerURL)
 	if err != nil {
-		log.Printf("[ERROR] " + fmt.Sprintf("Failed to dial UDP: %v", err))
-		http.Error(w, "Internal error", 500)
+		metrics.Misses.Add(1)
+		log.Printf("[WARN] " + fmt.Sprintf("Failed to fetch from peer %s: %v", peerAddr.IP, err))
+		http.Error(cw, "Failed to fetch from peer", 502)
 		return
 	}
-	defer conn.Close()
+	defer resp.Body.Close()
 
-	conn.Write([]byte("has_path?" + hash))
-	conn.SetReadDeadline(time.Now().Add(time.Second))
-	buf := make([]byte, 1024)
-
-	for {
-		n, peerAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			metrics.Misses.Add(1)
-			log.Printf("[INFO] " + fmt.Sprintf("No peers responded for %s", path))
-			http.Error(cw, "Not found in local store or peers", 404)
-			return
+	// Copy headers from peer response
+	for key, values := range resp.Header {
+		for _, value := range values {
+			cw.Header().Add(key, value)
 		}
-		if string(buf[:n]) == "yes" {
-			peerURL := "http://" + peerAddr.IP.String() + ":" + httpPort + r.URL.Path
-			log.Printf("[INFO] " + fmt.Sprintf("Found %s at peer %s, fetching from %s", path, peerAddr.IP, peerURL))
-			
-			client := &http.Client{Timeout: 10 * time.Second}
-			resp, err := client.Get(peerURL)
-			if err != nil {
-				log.Printf("[WARN] " + fmt.Sprintf("Failed to fetch from peer %s: %v", peerAddr.IP, err))
-				continue
-			}
-			defer resp.Body.Close()
-
-			// Copy headers from peer response
-			for key, values := range resp.Header {
-				for _, value := range values {
-					cw.Header().Add(key, value)
-				}
-			}
-			cw.WriteHeader(resp.StatusCode)
-			n, err := io.Copy(cw, resp.Body)
-			if err != nil {
-				log.Printf("[ERROR] " + fmt.Sprintf("Error copying from peer: %v", err))
-				http.Error(cw, err.Error(), 500)
-			} else {
-				metrics.Hits.Add(1)
-				metrics.FilesReceived.Add(1)
-				metrics.BytesReceived.Add(uint64(n))
-				log.Printf("[INFO] " + fmt.Sprintf("Successfully served %s from peer %s (%d bytes)", path, peerAddr.IP, n))
-			}
-			return
-		}
+	}
+	cw.WriteHeader(resp.StatusCode)
+	n, err := io.Copy(cw, resp.Body)
+	if err != nil {
+		log.Printf("[ERROR] " + fmt.Sprintf("Error copying from peer: %v", err))
+		http.Error(cw, err.Error(), 500)
+	} else {
+		metrics.Hits.Add(1)
+		metrics.FilesReceived.Add(1)
+		metrics.BytesReceived.Add(uint64(n))
+		log.Printf("[INFO] " + fmt.Sprintf("Successfully served %s from peer %s (%d bytes)", path, peerAddr.IP, n))
 	}
 }
