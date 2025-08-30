@@ -1,0 +1,22 @@
+# Nix build outputs
+result
+result-*
+
+# Archives
+*.zip
+*.tar.gz
+*.tar.bz2
+
+# Go build artifacts
+peernix
+
+# macOS
+.DS_Store
+
+# Editor directories
+.vscode/
+.idea/
+
+# Claude configuration (user-specific)
+.claude/
+CLAUDE.md
