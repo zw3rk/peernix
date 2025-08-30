@@ -168,6 +168,24 @@ func signNarInfo(content string) string {
 
 
 
+// detectNixDaemon detects which Nix daemon is running and returns restart command
+func detectNixDaemon() string {
+	// Check if Determinate Nix daemon is running
+	cmd := exec.Command("launchctl", "list", "systems.determinate.nix-daemon")
+	if err := cmd.Run(); err == nil {
+		return "sudo launchctl kickstart -k system/systems.determinate.nix-daemon"
+	}
+	
+	// Check if standard Nix daemon is running  
+	cmd = exec.Command("launchctl", "list", "org.nixos.nix-daemon")
+	if err := cmd.Run(); err == nil {
+		return "sudo launchctl kickstart -k system/org.nixos.nix-daemon"
+	}
+	
+	// Fallback to standard Nix daemon
+	return "sudo launchctl kickstart -k system/org.nixos.nix-daemon"
+}
+
 // checkNixConfig checks if peernix is configured as a substituter
 func checkNixConfig() {
 	substituterURL := fmt.Sprintf("http://localhost:%s/nix-cache/", httpPort)
@@ -194,9 +212,19 @@ func checkNixConfig() {
 		log.Printf("[WARN] In %s add:", configFile)
 		log.Printf("[WARN]   extra-substituters = %s", substituterURL)
 		log.Printf("[WARN]   extra-trusted-substituters = %s", substituterURL)
+		
+		// Add public key if signing is enabled
+		if signingEnabled {
+			publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
+			log.Printf("[WARN]   extra-trusted-public-keys = %s:%s", keyName, publicKeyEncoded)
+		}
+		
 		log.Printf("[WARN] ")
+		
+		// Detect and provide appropriate daemon restart command
+		daemonRestartCmd := detectNixDaemon()
 		log.Printf("[WARN] Then restart the nix daemon:")
-		log.Printf("[WARN]   sudo launchctl kickstart -k system/org.nixos.nix-daemon")
+		log.Printf("[WARN]   %s", daemonRestartCmd)
 		log.Printf("[WARN] ========================================")
 	} else {
 		log.Printf("[INFO] peernix is configured as a substituter ✓")
@@ -226,14 +254,14 @@ func main() {
 
 	logInfo("Starting peernix server on ports UDP:" + udpPort + " HTTP:" + httpPort)
 	
-	// Check nix configuration
-	checkNixConfig()
-
-	// Initialize signing (optional)
+	// Initialize signing (optional) - do this before config check
 	if err := initializeSigning(); err != nil {
 		log.Printf("[WARN] Signing disabled: %v", err)
 		signingEnabled = false
 	}
+
+	// Check nix configuration
+	checkNixConfig()
 
 
 	go udpServer()
