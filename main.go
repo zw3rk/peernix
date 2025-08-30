@@ -53,6 +53,8 @@ var (
 	peerClients  = make(map[string]*http.Client)
 	clientsMux   sync.RWMutex
 	signingKey   ed25519.PrivateKey
+	publicKey    ed25519.PublicKey
+	keyName      = "peernix-1" // Key identifier for signatures
 	signingEnabled = false
 )
 
@@ -128,6 +130,7 @@ func initializeSigning() error {
 	if keyData, err := os.ReadFile(keyFile); err == nil {
 		if len(keyData) == ed25519.PrivateKeySize {
 			signingKey = ed25519.PrivateKey(keyData)
+			publicKey = signingKey.Public().(ed25519.PublicKey)
 			signingEnabled = true
 			log.Printf("[INFO] Loaded existing signing key from %s", keyFile)
 			return nil
@@ -148,18 +151,19 @@ func initializeSigning() error {
 	}
 	
 	signingKey = privateKey
+	publicKey = privateKey.Public().(ed25519.PublicKey)
 	signingEnabled = true
 	return nil
 }
 
-// signNarInfo generates a signature for narinfo content
+// signNarInfo generates a signature for narinfo content using Nix format
 func signNarInfo(content string) string {
 	if !signingEnabled {
 		return ""
 	}
 	
 	signature := ed25519.Sign(signingKey, []byte(content))
-	return "1:" + base64.StdEncoding.EncodeToString(signature)
+	return keyName + ":" + base64.StdEncoding.EncodeToString(signature)
 }
 
 
@@ -237,6 +241,7 @@ func main() {
 	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/nix-cache/nix-cache-info", handleNixCacheInfo)
 	http.HandleFunc("/nix-cache/", handleNixCache)
+	http.HandleFunc("/public-key", handlePublicKey)
 	
 	log.Printf("[INFO] " + "HTTP server starting on :" + httpPort)
 	if err := http.ListenAndServe(":"+httpPort, nil); err != nil {
@@ -260,7 +265,7 @@ func handleNixCacheInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/x-nix-cache-info")
 	fmt.Fprintf(w, "StoreDir: /nix/store\n")
 	fmt.Fprintf(w, "WantMassQuery: 0\n")
-	fmt.Fprintf(w, "Priority: 50\n")
+	fmt.Fprintf(w, "Priority: 10\n")
 	log.Printf("[DEBUG] Served nix-cache-info to %s", r.RemoteAddr)
 }
 
@@ -320,6 +325,18 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP peernix_request_latency_ms Average request latency in milliseconds\n")
 	fmt.Fprintf(w, "# TYPE peernix_request_latency_ms gauge\n")
 	fmt.Fprintf(w, "peernix_request_latency_ms %d\n", avgLatency.Milliseconds())
+}
+
+func handlePublicKey(w http.ResponseWriter, r *http.Request) {
+	if !signingEnabled {
+		http.Error(w, "Signing not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "text/plain")
+	publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
+	fmt.Fprintf(w, "%s:%s\n", keyName, publicKeyEncoded)
+	log.Printf("[DEBUG] Served public key to %s", r.RemoteAddr)
 }
 
 func udpServer() {
