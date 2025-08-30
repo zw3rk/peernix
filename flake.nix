@@ -9,6 +9,17 @@
   outputs = { self, nixpkgs, flake-parts, ... }@inputs:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-darwin" "aarch64-darwin" ];
+      
+      flake = {
+        # Darwin module for nix-darwin
+        darwinModules.peernix = import ./darwin.nix;
+        darwinModules.default = self.darwinModules.peernix;
+        
+        # NixOS module
+        nixosModules.peernix = import ./nixos.nix;
+        nixosModules.default = self.nixosModules.peernix;
+      };
+      
       perSystem = { config, system, ... }:
         let
           pkgs = import nixpkgs { inherit system; };

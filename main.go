@@ -14,22 +14,61 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"encoding/json"
 )
 
-const (
-	udpPort  = "9999"
-	httpPort = "9999"
-)
+// Configuration represents peernix configuration settings
+type Config struct {
+	UDPPort           string        `conf:"udp-port"`
+	HTTPPort          string        `conf:"http-port"`
+	SigningEnabled    bool          `conf:"signing-enabled"`
+	KeyFile           string        `conf:"key-file"`
+	KeyName           string        `conf:"key-name"`
+	DiscoveryInterval time.Duration `conf:"discovery-interval"`
+	PeerTTL           time.Duration `conf:"peer-ttl"`
+	CompressionEnabled bool         `conf:"compression-enabled"`
+	MaxConnections    int           `conf:"max-connections"`
+}
+
+// Default configuration
+var config = Config{
+	UDPPort:           "9999",
+	HTTPPort:          "9999",
+	SigningEnabled:    true,
+	KeyFile:           "peernix-signing.key",
+	KeyName:           "peernix-1",
+	DiscoveryInterval: 5 * time.Minute,
+	PeerTTL:           10 * time.Minute,
+	CompressionEnabled: true,
+	MaxConnections:    10,
+}
 
 type Peer struct {
-	Addr string
-	TTL  time.Time
+	Addr         string
+	TTL          time.Time
+	Version      string // Peernix version
+	NixVersion   string // Nix version 
+	Platform     string // OS/arch info
+	Features     []string // Supported features
+	PublicKey    string // Ed25519 public key
+}
+
+// DiscoveryMessage represents the enhanced UDP discovery protocol
+type DiscoveryMessage struct {
+	Command       string   `json:"cmd"`
+	PeernixVersion string   `json:"peernix_version"`
+	NixVersion     string   `json:"nix_version,omitempty"`
+	Platform       string   `json:"platform,omitempty"`
+	Features       []string `json:"features,omitempty"`
+	PublicKey      string   `json:"public_key,omitempty"`
+	Port           int      `json:"port,omitempty"`
 }
 
 // Metrics holds all the metrics for Prometheus
@@ -110,8 +149,8 @@ func getPeerClient(peerAddr string) *http.Client {
 	client = &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:        10,
-			MaxIdleConnsPerHost: 2,
+			MaxIdleConns:        config.MaxConnections,
+			MaxIdleConnsPerHost: config.MaxConnections / 5,
 			IdleConnTimeout:     30 * time.Second,
 			DisableKeepAlives:   false,
 		},
@@ -124,7 +163,8 @@ func getPeerClient(peerAddr string) *http.Client {
 
 // initializeSigning sets up Ed25519 signing keys
 func initializeSigning() error {
-	keyFile := "peernix-signing.key"
+	keyFile := config.KeyFile
+	keyName = config.KeyName
 	
 	// Try to load existing key
 	if keyData, err := os.ReadFile(keyFile); err == nil {
@@ -166,7 +206,130 @@ func signNarInfo(content string) string {
 	return keyName + ":" + base64.StdEncoding.EncodeToString(signature)
 }
 
+// getNixVersion gets the local Nix version
+func getNixVersion() string {
+	cmd := exec.Command("nix", "--version")
+	output, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(output))
+}
 
+// getSupportedFeatures returns list of features this peernix instance supports
+func getSupportedFeatures() []string {
+	features := []string{"compression", "parallel", "health"}
+	if signingEnabled {
+		features = append(features, "signing")
+	}
+	return features
+}
+
+// createDiscoveryMessage creates a discovery message with current instance info
+func createDiscoveryMessage(command string) DiscoveryMessage {
+	msg := DiscoveryMessage{
+		Command:       command,
+		PeernixVersion: "2.0.0", // Version with enhanced discovery
+		Platform:      fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH),
+		Features:      getSupportedFeatures(),
+		Port:          mustParseInt(config.HTTPPort),
+	}
+	
+	// Add optional fields
+	if command == "announce" {
+		msg.NixVersion = getNixVersion()
+		if signingEnabled {
+			publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
+			msg.PublicKey = keyName + ":" + publicKeyEncoded
+		}
+	}
+	
+	return msg
+}
+
+// mustParseInt parses int or returns 0
+func mustParseInt(s string) int {
+	i, _ := strconv.Atoi(s)
+	return i
+}
+
+// loadConfig loads configuration from peernix.conf in nix.conf format
+func loadConfig() error {
+	configFile := "peernix.conf"
+	
+	// Check if config file exists
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("[INFO] No config file found, using defaults")
+			return nil
+		}
+		return fmt.Errorf("failed to read config file: %v", err)
+	}
+	
+	log.Printf("[INFO] Loading configuration from %s", configFile)
+	
+	// Parse nix.conf style configuration (key = value)
+	lines := strings.Split(string(data), "\n")
+	for lineNum, line := range lines {
+		line = strings.TrimSpace(line)
+		
+		// Skip comments and empty lines
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		// Parse key = value
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			log.Printf("[WARN] Invalid config line %d: %s", lineNum+1, line)
+			continue
+		}
+		
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		
+		// Apply configuration values
+		switch key {
+		case "udp-port":
+			config.UDPPort = value
+		case "http-port":
+			config.HTTPPort = value
+		case "signing-enabled":
+			config.SigningEnabled = value == "true" || value == "1" || value == "yes"
+		case "key-file":
+			config.KeyFile = value
+		case "key-name":
+			config.KeyName = value
+		case "discovery-interval":
+			if duration, err := time.ParseDuration(value); err == nil {
+				config.DiscoveryInterval = duration
+			} else {
+				log.Printf("[WARN] Invalid discovery-interval: %s", value)
+			}
+		case "peer-ttl":
+			if duration, err := time.ParseDuration(value); err == nil {
+				config.PeerTTL = duration
+			} else {
+				log.Printf("[WARN] Invalid peer-ttl: %s", value)
+			}
+		case "compression-enabled":
+			config.CompressionEnabled = value == "true" || value == "1" || value == "yes"
+		case "max-connections":
+			if num, err := strconv.Atoi(value); err == nil {
+				config.MaxConnections = num
+			} else {
+				log.Printf("[WARN] Invalid max-connections: %s", value)
+			}
+		default:
+			log.Printf("[WARN] Unknown config key: %s", key)
+		}
+	}
+	
+	log.Printf("[INFO] Configuration loaded: UDP=%s HTTP=%s Signing=%t Compression=%t", 
+		config.UDPPort, config.HTTPPort, config.SigningEnabled, config.CompressionEnabled)
+	return nil
+}
 
 // detectNixDaemon detects which Nix daemon is running and returns restart command
 func detectNixDaemon() string {
@@ -188,7 +351,7 @@ func detectNixDaemon() string {
 
 // checkNixConfig checks if peernix is configured as a substituter
 func checkNixConfig() {
-	substituterURL := fmt.Sprintf("http://localhost:%s/nix-cache/", httpPort)
+	substituterURL := fmt.Sprintf("http://localhost:%s/nix-cache/", config.HTTPPort)
 	
 	cmd := exec.Command("nix", "config", "show", "substituters")
 	output, err := cmd.Output()
@@ -233,6 +396,12 @@ func checkNixConfig() {
 
 func main() {
 	var err error
+	
+	// Load configuration first
+	if err := loadConfig(); err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+	
 	logger, err = syslog.New(syslog.LOG_INFO, "org.zw3rk.peernix")
 	if err != nil {
 		// Fall back to console logging if syslog fails
@@ -252,11 +421,16 @@ func main() {
 	localIPs = getLocalIPs()
 	logInfo(fmt.Sprintf("Local IPs: %v", localIPs))
 
-	logInfo("Starting peernix server on ports UDP:" + udpPort + " HTTP:" + httpPort)
+	logInfo("Starting peernix server on ports UDP:" + config.UDPPort + " HTTP:" + config.HTTPPort)
 	
 	// Initialize signing (optional) - do this before config check
-	if err := initializeSigning(); err != nil {
-		log.Printf("[WARN] Signing disabled: %v", err)
+	if config.SigningEnabled {
+		if err := initializeSigning(); err != nil {
+			log.Printf("[WARN] Signing disabled: %v", err)
+			signingEnabled = false
+		}
+	} else {
+		log.Printf("[INFO] Signing disabled by configuration")
 		signingEnabled = false
 	}
 
@@ -267,12 +441,13 @@ func main() {
 	go udpServer()
 	http.HandleFunc("/", handleRoot)
 	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/status", handleStatus)
 	http.HandleFunc("/nix-cache/nix-cache-info", handleNixCacheInfo)
 	http.HandleFunc("/nix-cache/", handleNixCache)
 	http.HandleFunc("/public-key", handlePublicKey)
 	
-	log.Printf("[INFO] " + "HTTP server starting on :" + httpPort)
-	if err := http.ListenAndServe(":"+httpPort, nil); err != nil {
+	log.Printf("[INFO] " + "HTTP server starting on :" + config.HTTPPort)
+	if err := http.ListenAndServe(":"+config.HTTPPort, nil); err != nil {
 		log.Printf("[ERROR] " + fmt.Sprintf("HTTP server failed: %v", err))
 	}
 }
@@ -367,8 +542,88 @@ func handlePublicKey(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[DEBUG] Served public key to %s", r.RemoteAddr)
 }
 
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	
+	// System information
+	fmt.Fprintf(w, "Peernix Status\n")
+	fmt.Fprintf(w, "==============\n\n")
+	fmt.Fprintf(w, "Version: 2.0.0\n")
+	fmt.Fprintf(w, "Platform: %s-%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(w, "Features: %s\n", strings.Join(getSupportedFeatures(), ", "))
+	fmt.Fprintf(w, "Signing: %t\n", signingEnabled)
+	if signingEnabled {
+		publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
+		fmt.Fprintf(w, "Public Key: %s:%s\n", keyName, publicKeyEncoded)
+	}
+	fmt.Fprintf(w, "Ports: UDP=%s HTTP=%s\n", config.UDPPort, config.HTTPPort)
+	fmt.Fprintf(w, "Compression: %t\n", config.CompressionEnabled)
+	fmt.Fprintf(w, "Discovery Interval: %s\n", config.DiscoveryInterval)
+	fmt.Fprintf(w, "Peer TTL: %s\n\n", config.PeerTTL)
+	
+	// Metrics summary
+	fmt.Fprintf(w, "Metrics\n")
+	fmt.Fprintf(w, "-------\n")
+	fmt.Fprintf(w, "Cache Hits: %d\n", metrics.Hits.Load())
+	fmt.Fprintf(w, "Cache Misses: %d\n", metrics.Misses.Load())
+	fmt.Fprintf(w, "Files Sent: %d\n", metrics.FilesSent.Load())
+	fmt.Fprintf(w, "Bytes Sent: %d\n", metrics.BytesSent.Load())
+	fmt.Fprintf(w, "Files Received: %d\n", metrics.FilesReceived.Load())
+	fmt.Fprintf(w, "Bytes Received: %d\n", metrics.BytesReceived.Load())
+	
+	// Average latency
+	metrics.RequestMux.RLock()
+	var avgLatency time.Duration
+	if len(metrics.RequestTimes) > 0 {
+		var total time.Duration
+		for _, t := range metrics.RequestTimes {
+			total += t
+		}
+		avgLatency = total / time.Duration(len(metrics.RequestTimes))
+	}
+	metrics.RequestMux.RUnlock()
+	fmt.Fprintf(w, "Avg Latency: %s\n\n", avgLatency.String())
+	
+	// Discovered peers
+	peersMux.RLock()
+	peerCount := len(peers)
+	currentPeers := make([]Peer, len(peers))
+	copy(currentPeers, peers)
+	peersMux.RUnlock()
+	
+	fmt.Fprintf(w, "Discovered Peers (%d)\n", peerCount)
+	fmt.Fprintf(w, "----------------\n")
+	if peerCount == 0 {
+		fmt.Fprintf(w, "No peers discovered yet.\n")
+	} else {
+		for _, peer := range currentPeers {
+			fmt.Fprintf(w, "Peer: %s\n", peer.Addr)
+			if peer.Version != "" {
+				fmt.Fprintf(w, "  Peernix Version: %s\n", peer.Version)
+			}
+			if peer.NixVersion != "" {
+				fmt.Fprintf(w, "  Nix Version: %s\n", peer.NixVersion)
+			}
+			if peer.Platform != "" {
+				fmt.Fprintf(w, "  Platform: %s\n", peer.Platform)
+			}
+			if len(peer.Features) > 0 {
+				fmt.Fprintf(w, "  Features: %s\n", strings.Join(peer.Features, ", "))
+			}
+			if peer.PublicKey != "" {
+				fmt.Fprintf(w, "  Public Key: %s\n", peer.PublicKey)
+			}
+			fmt.Fprintf(w, "  Last Seen: %s\n", peer.TTL.Add(-config.PeerTTL).Format("15:04:05"))
+			fmt.Fprintf(w, "  Expires: %s\n", peer.TTL.Format("15:04:05"))
+			fmt.Fprintf(w, "\n")
+		}
+	}
+	
+	log.Printf("[DEBUG] Served status to %s", r.RemoteAddr)
+}
+
 func udpServer() {
-	port, _ := strconv.Atoi(udpPort)
+	port, _ := strconv.Atoi(config.UDPPort)
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 	if err != nil {
 		log.Printf("[ERROR] " + fmt.Sprintf("Failed to start UDP server: %v", err))
@@ -376,10 +631,10 @@ func udpServer() {
 	}
 	defer conn.Close()
 	conn.SetWriteBuffer(1024)
-	log.Printf("[INFO] " + "UDP server started on :" + udpPort)
+	log.Printf("[INFO] " + "UDP server started on :" + config.UDPPort)
 
 	go func() {
-		for range time.Tick(5 * time.Minute) {
+		for range time.Tick(config.DiscoveryInterval) {
 			log.Printf("[DEBUG] " + "Running periodic peer discovery")
 			updatePeers()
 		}
@@ -405,12 +660,60 @@ func udpServer() {
 					log.Printf("[DEBUG] " + fmt.Sprintf("Path not found locally: %s", hash))
 				}
 			} else if msg == "ping" {
-				// Don't respond to our own pings
+				// Backward compatibility: simple ping/pong
 				if isLocalIP(addr.IP.String()) {
 					log.Printf("[DEBUG] " + fmt.Sprintf("Ignoring ping from self (%s)", addr))
 				} else {
 					log.Printf("[DEBUG] " + fmt.Sprintf("Received ping from %s, sending pong", addr))
 					conn.WriteToUDP([]byte("pong"), addr)
+				}
+			} else if strings.HasPrefix(msg, "{") {
+				// Enhanced discovery protocol: JSON message
+				var discoveryMsg DiscoveryMessage
+				if err := json.Unmarshal([]byte(msg), &discoveryMsg); err != nil {
+					log.Printf("[WARN] Invalid JSON discovery message from %s: %v", addr, err)
+					return
+				}
+				
+				if discoveryMsg.Command == "announce" && !isLocalIP(addr.IP.String()) {
+					log.Printf("[INFO] Enhanced peer announcement from %s: %s v%s (%s)", 
+						addr.IP.String(), discoveryMsg.Platform, discoveryMsg.PeernixVersion, 
+						strings.Join(discoveryMsg.Features, ","))
+					
+					// Add enhanced peer info
+					peersMux.Lock()
+					found := false
+					for i, peer := range peers {
+						if peer.Addr == addr.IP.String() {
+							// Update existing peer with enhanced info
+							peers[i].TTL = time.Now().Add(config.PeerTTL)
+							peers[i].Version = discoveryMsg.PeernixVersion
+							peers[i].NixVersion = discoveryMsg.NixVersion
+							peers[i].Platform = discoveryMsg.Platform
+							peers[i].Features = discoveryMsg.Features
+							peers[i].PublicKey = discoveryMsg.PublicKey
+							found = true
+							break
+						}
+					}
+					if !found {
+						peers = append(peers, Peer{
+							Addr:       addr.IP.String(),
+							TTL:        time.Now().Add(config.PeerTTL),
+							Version:    discoveryMsg.PeernixVersion,
+							NixVersion: discoveryMsg.NixVersion,
+							Platform:   discoveryMsg.Platform,
+							Features:   discoveryMsg.Features,
+							PublicKey:  discoveryMsg.PublicKey,
+						})
+					}
+					peersMux.Unlock()
+					
+					// Send back our announcement
+					response := createDiscoveryMessage("announce")
+					if responseBytes, err := json.Marshal(response); err == nil {
+						conn.WriteToUDP(responseBytes, addr)
+					}
 				}
 			} else {
 				log.Printf("[DEBUG] " + fmt.Sprintf("Unknown UDP message from %s: %s", addr, msg))
@@ -420,12 +723,12 @@ func udpServer() {
 }
 
 func updatePeers() {
-	// Run UDP discovery
+	// Run UDP discovery with enhanced protocol
 	go updatePeersUDP()
 }
 
 func updatePeersUDP() {
-	addr, err := net.ResolveUDPAddr("udp", "255.255.255.255:"+udpPort)
+	addr, err := net.ResolveUDPAddr("udp", "255.255.255.255:"+config.UDPPort)
 	if err != nil {
 		log.Printf("[WARN] " + fmt.Sprintf("Failed to resolve broadcast address: %v", err))
 		return
@@ -438,10 +741,19 @@ func updatePeersUDP() {
 	}
 	defer conn.Close()
 
-	log.Printf("[DEBUG] " + "Broadcasting ping for UDP peer discovery")
-	conn.Write([]byte("ping"))
-	conn.SetReadDeadline(time.Now().Add(time.Second))
-	buf := make([]byte, 1024)
+	// Send enhanced discovery message
+	discoveryMsg := createDiscoveryMessage("announce")
+	msgBytes, err := json.Marshal(discoveryMsg)
+	if err != nil {
+		log.Printf("[WARN] Failed to marshal discovery message: %v", err)
+		// Fallback to simple ping
+		msgBytes = []byte("ping")
+	}
+	
+	log.Printf("[DEBUG] Broadcasting enhanced discovery for UDP peer discovery")
+	conn.Write(msgBytes)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second)) // Longer timeout for JSON
+	buf := make([]byte, 2048) // Larger buffer for JSON
 
 	newPeers := []Peer{}
 	for {
@@ -449,15 +761,39 @@ func updatePeersUDP() {
 		if err != nil {
 			break
 		}
-		if string(buf[:n]) == "pong" {
-			// Don't add ourselves as a peer
-			if !isLocalIP(addr.IP.String()) {
-				peer := Peer{Addr: addr.IP.String(), TTL: time.Now().Add(5 * time.Minute)}
+		
+		response := string(buf[:n])
+		if !isLocalIP(addr.IP.String()) {
+			if response == "pong" {
+				// Backward compatibility: simple pong response
+				peer := Peer{
+					Addr: addr.IP.String(), 
+					TTL: time.Now().Add(config.PeerTTL/2),
+					Version: "1.x", // Assume older version
+				}
 				newPeers = append(newPeers, peer)
-				log.Printf("[INFO] " + fmt.Sprintf("Discovered peer via UDP: %s", addr.IP.String()))
-			} else {
-				log.Printf("[DEBUG] " + fmt.Sprintf("Ignoring pong from self (%s)", addr.IP.String()))
+				log.Printf("[INFO] Discovered legacy peer via UDP: %s", addr.IP.String())
+			} else if strings.HasPrefix(response, "{") {
+				// Enhanced discovery: JSON response
+				var discoveryResp DiscoveryMessage
+				if err := json.Unmarshal([]byte(response), &discoveryResp); err == nil {
+					peer := Peer{
+						Addr:       addr.IP.String(),
+						TTL:        time.Now().Add(config.PeerTTL),
+						Version:    discoveryResp.PeernixVersion,
+						NixVersion: discoveryResp.NixVersion,
+						Platform:   discoveryResp.Platform,
+						Features:   discoveryResp.Features,
+						PublicKey:  discoveryResp.PublicKey,
+					}
+					newPeers = append(newPeers, peer)
+					log.Printf("[INFO] Discovered enhanced peer via UDP: %s v%s (%s)", 
+						addr.IP.String(), discoveryResp.PeernixVersion, 
+						strings.Join(discoveryResp.Features, ","))
+				}
 			}
+		} else {
+			log.Printf("[DEBUG] Ignoring response from self (%s)", addr.IP.String())
 		}
 	}
 	
@@ -659,7 +995,7 @@ func queryPeersParallel(hash string) *net.UDPAddr {
 				}
 			}()
 			
-			addr, err := net.ResolveUDPAddr("udp", peerAddr+":"+udpPort)
+			addr, err := net.ResolveUDPAddr("udp", peerAddr+":"+config.UDPPort)
 			if err != nil {
 				results <- result{nil, err}
 				return
@@ -767,8 +1103,8 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 		metrics.RequestMux.Unlock()
 	}()
 
-	// Check if client supports compression
-	compress := supportsCompression(r.Header.Get("Accept-Encoding")) && isNar
+	// Check if client supports compression and compression is enabled
+	compress := config.CompressionEnabled && supportsCompression(r.Header.Get("Accept-Encoding")) && isNar
 	
 	// Check local store first
 	if hasPath(hash) {
@@ -816,7 +1152,7 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	// Fetch from the peer that responded
-	peerURL := "http://" + peerAddr.IP.String() + ":" + httpPort + r.URL.Path
+	peerURL := "http://" + peerAddr.IP.String() + ":" + config.HTTPPort + r.URL.Path
 	log.Printf("[INFO] " + fmt.Sprintf("Found %s at peer %s, fetching from %s", path, peerAddr.IP, peerURL))
 	
 	client := getPeerClient(peerAddr.IP.String())

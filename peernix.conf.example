@@ -1,0 +1,28 @@
+# Peernix Configuration File
+# Format: key = value (similar to nix.conf)
+
+# Network ports
+udp-port = 9999
+http-port = 9999
+
+# Signing configuration
+signing-enabled = true
+key-file = peernix-signing.key
+key-name = peernix-1
+
+# Discovery settings
+discovery-interval = 5m
+peer-ttl = 10m
+
+# Performance settings
+compression-enabled = true
+max-connections = 10
+
+# Examples with different values:
+# udp-port = 8888
+# http-port = 8888
+# signing-enabled = false
+# discovery-interval = 2m
+# peer-ttl = 5m
+# compression-enabled = false
+# max-connections = 20
