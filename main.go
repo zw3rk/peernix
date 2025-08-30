@@ -3,6 +3,9 @@ package main
 import (
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
 )
 
 const (
@@ -41,11 +45,15 @@ type Metrics struct {
 }
 
 var (
-	peers    []Peer
-	peersMux sync.RWMutex
-	logger   *syslog.Writer
-	localIPs []string
-	metrics  = &Metrics{}
+	peers        []Peer
+	peersMux     sync.RWMutex
+	logger       *syslog.Writer
+	localIPs     []string
+	metrics      = &Metrics{}
+	peerClients  = make(map[string]*http.Client)
+	clientsMux   sync.RWMutex
+	signingKey   ed25519.PrivateKey
+	signingEnabled = false
 )
 
 // getLocalIPs returns all local IP addresses
@@ -77,6 +85,84 @@ func isLocalIP(ip string) bool {
 func supportsCompression(acceptEncoding string) bool {
 	return strings.Contains(strings.ToLower(acceptEncoding), "gzip")
 }
+
+// getPeerClient returns a pooled HTTP client for a peer, creating one if needed
+func getPeerClient(peerAddr string) *http.Client {
+	clientsMux.RLock()
+	client, exists := peerClients[peerAddr]
+	clientsMux.RUnlock()
+	
+	if exists {
+		return client
+	}
+	
+	// Create new client with connection pooling
+	clientsMux.Lock()
+	defer clientsMux.Unlock()
+	
+	// Double-check after acquiring write lock
+	if client, exists := peerClients[peerAddr]; exists {
+		return client
+	}
+	
+	client = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Second,
+			DisableKeepAlives:   false,
+		},
+	}
+	
+	peerClients[peerAddr] = client
+	log.Printf("[DEBUG] Created HTTP client for peer %s", peerAddr)
+	return client
+}
+
+// initializeSigning sets up Ed25519 signing keys
+func initializeSigning() error {
+	keyFile := "peernix-signing.key"
+	
+	// Try to load existing key
+	if keyData, err := os.ReadFile(keyFile); err == nil {
+		if len(keyData) == ed25519.PrivateKeySize {
+			signingKey = ed25519.PrivateKey(keyData)
+			signingEnabled = true
+			log.Printf("[INFO] Loaded existing signing key from %s", keyFile)
+			return nil
+		}
+	}
+	
+	// Generate new key
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return fmt.Errorf("failed to generate signing key: %v", err)
+	}
+	
+	// Save key to file
+	if err := os.WriteFile(keyFile, privateKey, 0600); err != nil {
+		log.Printf("[WARN] Failed to save signing key: %v", err)
+	} else {
+		log.Printf("[INFO] Generated and saved new signing key to %s", keyFile)
+	}
+	
+	signingKey = privateKey
+	signingEnabled = true
+	return nil
+}
+
+// signNarInfo generates a signature for narinfo content
+func signNarInfo(content string) string {
+	if !signingEnabled {
+		return ""
+	}
+	
+	signature := ed25519.Sign(signingKey, []byte(content))
+	return "1:" + base64.StdEncoding.EncodeToString(signature)
+}
+
+
 
 // checkNixConfig checks if peernix is configured as a substituter
 func checkNixConfig() {
@@ -138,6 +224,13 @@ func main() {
 	
 	// Check nix configuration
 	checkNixConfig()
+
+	// Initialize signing (optional)
+	if err := initializeSigning(); err != nil {
+		log.Printf("[WARN] Signing disabled: %v", err)
+		signingEnabled = false
+	}
+
 
 	go udpServer()
 	http.HandleFunc("/", handleRoot)
@@ -282,6 +375,11 @@ func udpServer() {
 }
 
 func updatePeers() {
+	// Run UDP discovery
+	go updatePeersUDP()
+}
+
+func updatePeersUDP() {
 	addr, err := net.ResolveUDPAddr("udp", "255.255.255.255:"+udpPort)
 	if err != nil {
 		log.Printf("[WARN] " + fmt.Sprintf("Failed to resolve broadcast address: %v", err))
@@ -295,7 +393,7 @@ func updatePeers() {
 	}
 	defer conn.Close()
 
-	log.Printf("[DEBUG] " + "Broadcasting ping for peer discovery")
+	log.Printf("[DEBUG] " + "Broadcasting ping for UDP peer discovery")
 	conn.Write([]byte("ping"))
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	buf := make([]byte, 1024)
@@ -311,20 +409,43 @@ func updatePeers() {
 			if !isLocalIP(addr.IP.String()) {
 				peer := Peer{Addr: addr.IP.String(), TTL: time.Now().Add(5 * time.Minute)}
 				newPeers = append(newPeers, peer)
-				log.Printf("[INFO] " + fmt.Sprintf("Discovered peer: %s", addr.IP.String()))
+				log.Printf("[INFO] " + fmt.Sprintf("Discovered peer via UDP: %s", addr.IP.String()))
 			} else {
 				log.Printf("[DEBUG] " + fmt.Sprintf("Ignoring pong from self (%s)", addr.IP.String()))
 			}
 		}
 	}
 	
+	// Merge UDP discovered peers with existing ones
 	peersMux.Lock()
 	oldCount := len(peers)
-	peers = newPeers
+	for _, newPeer := range newPeers {
+		found := false
+		for i, peer := range peers {
+			if peer.Addr == newPeer.Addr {
+				peers[i].TTL = newPeer.TTL
+				found = true
+				break
+			}
+		}
+		if !found {
+			peers = append(peers, newPeer)
+		}
+	}
+	
+	// Remove expired peers
+	now := time.Now()
+	activePeers := []Peer{}
+	for _, peer := range peers {
+		if peer.TTL.After(now) {
+			activePeers = append(activePeers, peer)
+		}
+	}
+	peers = activePeers
 	peersMux.Unlock()
 	
-	if oldCount != len(newPeers) {
-		log.Printf("[INFO] " + fmt.Sprintf("Peer count changed: %d -> %d", oldCount, len(newPeers)))
+	if oldCount != len(peers) {
+		log.Printf("[INFO] " + fmt.Sprintf("Active peer count: %d", len(peers)))
 	}
 }
 
@@ -433,7 +554,32 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 		return err
 	}
 	_, err = w.Write([]byte("Deriver: " + string(deriver) + "\n"))
-	return err
+	if err != nil {
+		return err
+	}
+	
+	// Add signature if signing is enabled
+	if signingEnabled {
+		// Build the content to sign (everything except the signature)
+		content := fmt.Sprintf("StorePath: %s\nURL: %s\nCompression: %s\nFileHash: %s\nFileSize: %s\nNarHash: %s\nNarSize: %s\nReferences: %s\nDeriver: %s\n",
+			fullPath,
+			url,
+			compression,
+			fileHash,
+			fileSize,
+			narHash,
+			strings.TrimSpace(string(size)),
+			strings.ReplaceAll(string(refs), "\n", " "),
+			string(deriver))
+		
+		signature := signNarInfo(content)
+		_, err = w.Write([]byte("Sig: " + signature + "\n"))
+		if err != nil {
+			return err
+		}
+	}
+	
+	return nil
 }
 
 // queryPeersParallel queries all known peers in parallel for a hash
@@ -628,7 +774,7 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	peerURL := "http://" + peerAddr.IP.String() + ":" + httpPort + r.URL.Path
 	log.Printf("[INFO] " + fmt.Sprintf("Found %s at peer %s, fetching from %s", path, peerAddr.IP, peerURL))
 	
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := getPeerClient(peerAddr.IP.String())
 	resp, err := client.Get(peerURL)
 	if err != nil {
 		metrics.Misses.Add(1)

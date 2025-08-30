@@ -17,9 +17,9 @@
           packages.default = pkgs.buildGoModule {
             name = "org.zw3rk.peernix";
             src = ./.;
-            vendorHash = null; # No external Go deps
+            vendorHash = null;
             subPackages = [ "." ];
-            buildInputs = [ ]; #pkgs.darwin.apple_sdk.frameworks.SystemConfiguration ];
+            buildInputs = [ ];
             installPhase = ''
               runHook preInstall
               mkdir -p $out/bin
