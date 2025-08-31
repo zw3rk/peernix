@@ -46,8 +46,8 @@ var config = Config{
 	SigningEnabled:    true,
 	KeyFile:           "peernix-signing.key",
 	KeyName:           "peernix-1",
-	DiscoveryInterval: 5 * time.Minute,
-	PeerTTL:           10 * time.Minute,
+	DiscoveryInterval: 30 * time.Second,
+	PeerTTL:           2 * time.Minute,
 	CompressionEnabled: true,
 	MaxConnections:    10,
 }
@@ -659,7 +659,25 @@ func udpServer() {
 	conn.SetWriteBuffer(1024)
 	log.Printf("[INFO] " + "UDP server started on :" + config.UDPPort)
 
+	// Announce presence immediately on startup
+	log.Printf("[INFO] " + "Running initial peer discovery")
+	go updatePeers()
+	
+	// Aggressive initial discovery: 5 attempts at 10-second intervals
 	go func() {
+		for i := 0; i < 5; i++ {
+			time.Sleep(10 * time.Second)
+			log.Printf("[INFO] " + fmt.Sprintf("Running aggressive initial discovery %d/5", i+1))
+			updatePeers()
+		}
+		log.Printf("[INFO] " + "Initial aggressive discovery phase completed")
+	}()
+	
+	// Start periodic discovery after initial phase
+	go func() {
+		// Wait for aggressive phase to complete
+		time.Sleep(60 * time.Second)
+		
 		for range time.Tick(config.DiscoveryInterval) {
 			log.Printf("[DEBUG] " + "Running periodic peer discovery")
 			updatePeers()
@@ -879,7 +897,7 @@ func updatePeersMDNS() {
 		}
 	}()
 	
-	// Start advertising our service
+	// Start advertising our service continuously
 	go func() {
 		// Service info with our capabilities
 		info := []string{
@@ -905,10 +923,10 @@ func updatePeersMDNS() {
 		}
 		defer server.Shutdown()
 		
-		log.Printf("[INFO] mDNS service advertising started")
+		log.Printf("[INFO] mDNS service advertising started (continuous)")
 		
-		// Keep advertising for discovery interval duration
-		time.Sleep(config.DiscoveryInterval)
+		// Keep advertising until process terminates
+		select {} // Block forever to keep advertising
 	}()
 	
 	// Process discovered entries
