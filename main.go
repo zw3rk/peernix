@@ -49,7 +49,7 @@ var config = Config{
 	DiscoveryInterval: 30 * time.Second,
 	PeerTTL:           2 * time.Minute,
 	CompressionEnabled: true,
-	MaxConnections:    10,
+	MaxConnections:    100,
 }
 
 type Peer struct {
@@ -179,7 +179,7 @@ func getPeerClient(peerAddr string) *http.Client {
 		Transport: &http.Transport{
 			// Connection pool settings optimized for peer-to-peer usage
 			MaxIdleConns:        config.MaxConnections,
-			MaxIdleConnsPerHost: 2, // Limit per host to prevent resource exhaustion
+			MaxIdleConnsPerHost: 20, // Limit per host to prevent resource exhaustion
 			IdleConnTimeout:     60 * time.Second, // Keep connections longer for efficiency
 			DisableKeepAlives:   false,
 			
