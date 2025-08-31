@@ -1222,18 +1222,30 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.Write([]byte("References: " + strings.ReplaceAll(string(refs), "\n", " ") + "\n"))
+	// Process references to remove /nix/store/ prefix
+	refPaths := strings.Fields(strings.TrimSpace(string(refs)))
+	refNames := make([]string, len(refPaths))
+	for i, refPath := range refPaths {
+		refNames[i] = strings.TrimPrefix(refPath, "/nix/store/")
+	}
+	_, err = w.Write([]byte("References: " + strings.Join(refNames, " ") + "\n"))
 	if err != nil {
 		return err
 	}
-	_, err = w.Write([]byte("Deriver: " + string(deriver) + "\n"))
+	// Process deriver to remove /nix/store/ prefix
+	deriverPath := strings.TrimSpace(string(deriver))
+	deriverName := strings.TrimPrefix(deriverPath, "/nix/store/")
+	if deriverName == "" || deriverName == "unknown-deriver" {
+		deriverName = "unknown-deriver"
+	}
+	_, err = w.Write([]byte("Deriver: " + deriverName + "\n"))
 	if err != nil {
 		return err
 	}
 	
 	// Add signature if signing is enabled
 	if signingEnabled {
-		// Build the content to sign (everything except the signature)
+		// Build the content to sign (everything except the signature) with corrected field formats
 		content := fmt.Sprintf("StorePath: %s\nURL: %s\nCompression: %s\nFileHash: %s\nFileSize: %s\nNarHash: %s\nNarSize: %s\nReferences: %s\nDeriver: %s\n",
 			fullPath,
 			url,
@@ -1242,8 +1254,8 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 			fileSize,
 			narHash,
 			strings.TrimSpace(string(size)),
-			strings.ReplaceAll(string(refs), "\n", " "),
-			string(deriver))
+			strings.Join(refNames, " "),
+			deriverName)
 		
 		signature := signNarInfo(content)
 		_, err = w.Write([]byte("Sig: " + signature + "\n"))
