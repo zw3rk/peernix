@@ -78,14 +78,18 @@ type DiscoveryMessage struct {
 
 // Metrics holds all the metrics for Prometheus
 type Metrics struct {
-	Hits          atomic.Uint64
-	Misses        atomic.Uint64
-	FilesSent     atomic.Uint64
-	BytesSent     atomic.Uint64
-	FilesReceived atomic.Uint64
-	BytesReceived atomic.Uint64
-	RequestTimes  []time.Duration
-	RequestMux    sync.RWMutex
+	Hits                  atomic.Uint64
+	Misses                atomic.Uint64
+	FilesSent             atomic.Uint64
+	BytesSent             atomic.Uint64
+	FilesReceived         atomic.Uint64
+	BytesReceived         atomic.Uint64
+	UDPQueriesReceived    atomic.Uint64 // Total UDP query requests received
+	UDPQueriesFound       atomic.Uint64 // UDP queries we responded "yes" to
+	PeerQueriesAttempted  atomic.Uint64 // Queries we made to peers
+	PeerQueriesSuccessful atomic.Uint64 // Successful peer queries
+	RequestTimes          []time.Duration
+	RequestMux            sync.RWMutex
 }
 
 var (
@@ -100,6 +104,10 @@ var (
 	publicKey    ed25519.PublicKey
 	keyName      = "peernix-1" // Key identifier for signatures
 	signingEnabled = false
+	
+	// mDNS server instance (global to prevent leaks)
+	mdnsServer   *mdns.Server
+	mdnsShutdown context.CancelFunc
 	
 	// Request deduplication
 	pendingRequests = make(map[string]chan *net.UDPAddr)
@@ -169,10 +177,22 @@ func getPeerClient(peerAddr string) *http.Client {
 	client = &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
+			// Connection pool settings optimized for peer-to-peer usage
 			MaxIdleConns:        config.MaxConnections,
-			MaxIdleConnsPerHost: config.MaxConnections / 5,
-			IdleConnTimeout:     30 * time.Second,
+			MaxIdleConnsPerHost: 2, // Limit per host to prevent resource exhaustion
+			IdleConnTimeout:     60 * time.Second, // Keep connections longer for efficiency
 			DisableKeepAlives:   false,
+			
+			// Connection establishment timeouts for better responsiveness
+			DialContext: (&net.Dialer{
+				Timeout: 3 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout: 2 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Second,
+			
+			// Connection reuse settings
+			MaxConnsPerHost:     3, // Limit concurrent connections per peer
+			ForceAttemptHTTP2:   false, // Disable HTTP/2 for simplicity
 		},
 	}
 	
@@ -457,6 +477,10 @@ func main() {
 	// Check nix configuration
 	checkNixConfig()
 
+	// Start mDNS service advertising once
+	if err := startMDNSServer(); err != nil {
+		log.Printf("[WARN] Failed to start mDNS server: %v", err)
+	}
 
 	go udpServer()
 	http.HandleFunc("/", handleRoot)
@@ -541,6 +565,22 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP peernix_bytes_received_total Total bytes received from peers\n")
 	fmt.Fprintf(w, "# TYPE peernix_bytes_received_total counter\n")
 	fmt.Fprintf(w, "peernix_bytes_received_total %d\n", metrics.BytesReceived.Load())
+	
+	fmt.Fprintf(w, "# HELP peernix_udp_queries_received_total Total UDP query requests received\n")
+	fmt.Fprintf(w, "# TYPE peernix_udp_queries_received_total counter\n")
+	fmt.Fprintf(w, "peernix_udp_queries_received_total %d\n", metrics.UDPQueriesReceived.Load())
+	
+	fmt.Fprintf(w, "# HELP peernix_udp_queries_found_total UDP queries we responded yes to\n")
+	fmt.Fprintf(w, "# TYPE peernix_udp_queries_found_total counter\n")
+	fmt.Fprintf(w, "peernix_udp_queries_found_total %d\n", metrics.UDPQueriesFound.Load())
+	
+	fmt.Fprintf(w, "# HELP peernix_peer_queries_attempted_total Queries we made to peers\n")
+	fmt.Fprintf(w, "# TYPE peernix_peer_queries_attempted_total counter\n")
+	fmt.Fprintf(w, "peernix_peer_queries_attempted_total %d\n", metrics.PeerQueriesAttempted.Load())
+	
+	fmt.Fprintf(w, "# HELP peernix_peer_queries_successful_total Successful peer queries\n")
+	fmt.Fprintf(w, "# TYPE peernix_peer_queries_successful_total counter\n")
+	fmt.Fprintf(w, "peernix_peer_queries_successful_total %d\n", metrics.PeerQueriesSuccessful.Load())
 	
 	fmt.Fprintf(w, "# HELP peernix_peers_current Current number of known peers\n")
 	fmt.Fprintf(w, "# TYPE peernix_peers_current gauge\n")
@@ -663,32 +703,24 @@ func udpServer() {
 	log.Printf("[INFO] " + "Running initial peer discovery")
 	go updatePeers()
 	
-	// Aggressive initial discovery: 5 attempts at 10-second intervals
+	// Reduced initial discovery: 2 attempts at 5-second intervals for lower idle load
 	go func() {
-		for i := 0; i < 5; i++ {
-			time.Sleep(10 * time.Second)
-			log.Printf("[INFO] " + fmt.Sprintf("Running aggressive initial discovery %d/5", i+1))
+		for i := 0; i < 2; i++ {
+			time.Sleep(5 * time.Second)
+			log.Printf("[INFO] " + fmt.Sprintf("Running initial discovery %d/2", i+1))
 			updatePeers()
 		}
-		log.Printf("[INFO] " + "Initial aggressive discovery phase completed")
+		log.Printf("[INFO] " + "Initial discovery phase completed")
 	}()
 	
 	// Start periodic discovery after initial phase
 	go func() {
-		// Wait for aggressive phase to complete
-		time.Sleep(60 * time.Second)
+		// Wait for initial phase to complete
+		time.Sleep(15 * time.Second)
 		
 		for range time.Tick(config.DiscoveryInterval) {
 			log.Printf("[DEBUG] " + "Running periodic peer discovery")
 			updatePeers()
-		}
-	}()
-	
-	// Start peer health checker
-	go func() {
-		for range time.Tick(2 * time.Minute) {
-			log.Printf("[DEBUG] " + "Running peer health checks")
-			checkPeerHealth()
 		}
 	}()
 
@@ -704,8 +736,10 @@ func udpServer() {
 		go func(msg string, addr *net.UDPAddr) {
 			if strings.HasPrefix(msg, "has_path?") {
 				hash := strings.TrimPrefix(msg, "has_path?")
+				metrics.UDPQueriesReceived.Add(1)
 				log.Printf("[DEBUG] " + fmt.Sprintf("Received path query from %s for hash: %s", addr, hash))
 				if hasPath(hash) {
+					metrics.UDPQueriesFound.Add(1)
 					log.Printf("[INFO] " + fmt.Sprintf("Responding YES to %s for hash: %s", addr, hash))
 					conn.WriteToUDP([]byte("yes"), addr)
 				} else {
@@ -868,20 +902,66 @@ func updatePeersUDP() {
 		}
 	}
 	
-	// Remove expired peers
+	// Remove expired peers and cleanup their HTTP clients
 	now := time.Now()
 	activePeers := []Peer{}
+	expiredPeers := []string{}
 	for _, peer := range peers {
 		if peer.TTL.After(now) {
 			activePeers = append(activePeers, peer)
+		} else {
+			expiredPeers = append(expiredPeers, peer.Addr)
 		}
 	}
 	peers = activePeers
 	peersMux.Unlock()
 	
+	// Cleanup HTTP clients for expired peers
+	if len(expiredPeers) > 0 {
+		clientsMux.Lock()
+		for _, peerAddr := range expiredPeers {
+			if client, exists := peerClients[peerAddr]; exists {
+				// Close idle connections
+				if transport, ok := client.Transport.(*http.Transport); ok {
+					transport.CloseIdleConnections()
+				}
+				delete(peerClients, peerAddr)
+				log.Printf("[DEBUG] Cleaned up HTTP client for expired peer %s", peerAddr)
+			}
+		}
+		clientsMux.Unlock()
+	}
+	
 	if oldCount != len(peers) {
 		log.Printf("[INFO] " + fmt.Sprintf("Active peer count: %d", len(peers)))
 	}
+}
+
+// startMDNSServer starts a single mDNS server instance for service advertising
+func startMDNSServer() error {
+	// Service info with our capabilities
+	info := []string{
+		fmt.Sprintf("version=%s", "2.0.0"),
+		fmt.Sprintf("platform=%s", fmt.Sprintf("%s-%s", runtime.GOARCH, runtime.GOOS)),
+		fmt.Sprintf("features=%s", strings.Join(getSupportedFeatures(), ",")),
+	}
+	if signingEnabled {
+		publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
+		info = append(info, fmt.Sprintf("pubkey=%s:%s", keyName, publicKeyEncoded))
+	}
+	
+	service, err := mdns.NewMDNSService("peernix", "_peernix._tcp", "", "", mustParseInt(config.HTTPPort), nil, info)
+	if err != nil {
+		return fmt.Errorf("failed to create mDNS service: %v", err)
+	}
+	
+	mdnsServer, err = mdns.NewServer(&mdns.Config{Zone: service})
+	if err != nil {
+		return fmt.Errorf("failed to start mDNS server: %v", err)
+	}
+	
+	log.Printf("[INFO] mDNS service advertising started")
+	return nil
 }
 
 // updatePeersMDNS discovers peers using mDNS
@@ -897,40 +977,10 @@ func updatePeersMDNS() {
 		}
 	}()
 	
-	// Start advertising our service continuously
-	go func() {
-		// Service info with our capabilities
-		info := []string{
-			fmt.Sprintf("version=%s", "2.0.0"),
-			fmt.Sprintf("platform=%s", fmt.Sprintf("%s-%s", runtime.GOARCH, runtime.GOOS)),
-			fmt.Sprintf("features=%s", strings.Join(getSupportedFeatures(), ",")),
-		}
-		if signingEnabled {
-			publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
-			info = append(info, fmt.Sprintf("pubkey=%s:%s", keyName, publicKeyEncoded))
-		}
-		
-		service, err := mdns.NewMDNSService("peernix", "_peernix._tcp", "", "", mustParseInt(config.HTTPPort), nil, info)
-		if err != nil {
-			log.Printf("[WARN] Failed to create mDNS service: %v", err)
-			return
-		}
-		
-		server, err := mdns.NewServer(&mdns.Config{Zone: service})
-		if err != nil {
-			log.Printf("[WARN] Failed to start mDNS server: %v", err)
-			return
-		}
-		defer server.Shutdown()
-		
-		log.Printf("[INFO] mDNS service advertising started (continuous)")
-		
-		// Keep advertising until process terminates
-		select {} // Block forever to keep advertising
-	}()
+	// Note: mDNS advertising is now handled by global server started at startup
 	
-	// Process discovered entries
-	timeout := time.After(5 * time.Second)
+	// Process discovered entries with shorter timeout for reduced idle load
+	timeout := time.After(3 * time.Second)
 	newPeers := []Peer{}
 	
 	for {
@@ -1003,97 +1053,8 @@ merge_peers:
 	}
 }
 
-// checkPeerHealth performs health checks on all known peers
-func checkPeerHealth() {
-	peersMux.RLock()
-	currentPeers := make([]Peer, len(peers))
-	copy(currentPeers, peers)
-	peersMux.RUnlock()
-	
-	if len(currentPeers) == 0 {
-		return
-	}
-	
-	type healthResult struct {
-		addr         string
-		responseTime time.Duration
-		err          error
-	}
-	
-	results := make(chan healthResult, len(currentPeers))
-	
-	// Check each peer concurrently for resource efficiency
-	for _, peer := range currentPeers {
-		go func(peerAddr string) {
-			start := time.Now()
-			client := getPeerClient(peerAddr)
-			resp, err := client.Get(fmt.Sprintf("http://%s:%s/ping", peerAddr, config.HTTPPort))
-			responseTime := time.Since(start)
-			
-			if err != nil {
-				results <- healthResult{peerAddr, 0, err}
-				return
-			}
-			defer resp.Body.Close()
-			
-			if resp.StatusCode == 200 {
-				results <- healthResult{peerAddr, responseTime, nil}
-			} else {
-				results <- healthResult{peerAddr, 0, fmt.Errorf("HTTP %d", resp.StatusCode)}
-			}
-		}(peer.Addr)
-	}
-	
-	// Collect results and update peer status
-	healthyCount := 0
-	for i := 0; i < len(currentPeers); i++ {
-		result := <-results
-		
-		peersMux.Lock()
-		for j, peer := range peers {
-			if peer.Addr == result.addr {
-				if result.err == nil {
-					// Successful health check
-					peers[j].LastSeen = time.Now()
-					peers[j].FailureCount = 0
-					// Update rolling average response time
-					if peers[j].ResponseTime == 0 {
-						peers[j].ResponseTime = result.responseTime
-					} else {
-						peers[j].ResponseTime = (peers[j].ResponseTime + result.responseTime) / 2
-					}
-					healthyCount++
-				} else {
-					// Failed health check
-					peers[j].FailureCount++
-					log.Printf("[WARN] Peer %s health check failed (failures: %d): %v", 
-						result.addr, peers[j].FailureCount, result.err)
-				}
-				break
-			}
-		}
-		peersMux.Unlock()
-	}
-	
-	// Remove peers with too many consecutive failures (resource conservation)
-	peersMux.Lock()
-	activePeers := []Peer{}
-	removedCount := 0
-	for _, peer := range peers {
-		if peer.FailureCount < 3 { // Allow 3 failures before removal
-			activePeers = append(activePeers, peer)
-		} else {
-			removedCount++
-			log.Printf("[INFO] Removing unhealthy peer: %s (failures: %d)", peer.Addr, peer.FailureCount)
-		}
-	}
-	peers = activePeers
-	peersMux.Unlock()
-	
-	if removedCount > 0 {
-		log.Printf("[INFO] Health check completed: %d healthy, %d removed", healthyCount, removedCount)
-	}
-}
+// Health checks removed - peers are considered healthy if they respond to discovery pings
+// and are automatically removed based on TTL expiry
 
 // findStorePath finds the full store path for a given hash with caching
 func findStorePath(hash string) (string, bool) {
@@ -1359,6 +1320,7 @@ func queryPeersParallel(hash string) *net.UDPAddr {
 				}
 				
 				conn.SetDeadline(time.Now().Add(1 * time.Second))
+				metrics.PeerQueriesAttempted.Add(1)
 				_, err = conn.Write([]byte("has_path?" + hash))
 				if err != nil {
 					conn.Close()
@@ -1400,6 +1362,7 @@ func queryPeersParallel(hash string) *net.UDPAddr {
 				}
 				
 				if string(buf[:n]) == "yes" {
+					metrics.PeerQueriesSuccessful.Add(1)
 					// Update peer health on successful response
 					peersMux.Lock()
 					for i := range peers {
@@ -1548,43 +1511,7 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 		metrics.RequestMux.Unlock()
 	}()
 
-	// Check if client supports compression and compression is enabled
-	compress := config.CompressionEnabled && supportsCompression(r.Header.Get("Accept-Encoding")) && isNar
-	
-	// Check local store first
-	if hasPath(hash) {
-		metrics.Hits.Add(1)
-		log.Printf("[INFO] " + fmt.Sprintf("Serving %s from local store", path))
-		if isNarInfo {
-			cw.Header().Set("Content-Type", "text/x-nix-narinfo")
-			err := generateNarInfo(hash, cw, compress)
-			if err != nil {
-				log.Printf("[ERROR] " + fmt.Sprintf("Failed to generate narinfo for %s: %v", hash, err))
-				http.Error(cw, err.Error(), 500)
-			} else {
-				metrics.FilesSent.Add(1)
-				metrics.BytesSent.Add(uint64(cw.bytes))
-			}
-		} else {
-			cw.Header().Set("Content-Type", "application/x-nix-nar")
-			if compress {
-				cw.Header().Set("Content-Encoding", "gzip")
-				log.Printf("[DEBUG] " + fmt.Sprintf("Compressing NAR for %s", hash))
-			}
-			err := generateNar(hash, cw, compress)
-			if err != nil {
-				log.Printf("[ERROR] " + fmt.Sprintf("Failed to generate nar for %s: %v", hash, err))
-				http.Error(cw, err.Error(), 500)
-			} else {
-				metrics.FilesSent.Add(1)
-				metrics.BytesSent.Add(uint64(cw.bytes))
-				if compress {
-					log.Printf("[INFO] " + fmt.Sprintf("Served compressed NAR for %s (%d bytes)", hash, cw.bytes))
-				}
-			}
-		}
-		return
-	}
+	// Skip local store check - if Nix queries us, it already knows the path isn't local
 
 	// Request deduplication: check if another request is already querying for this hash
 	var peerAddr *net.UDPAddr
