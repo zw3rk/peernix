@@ -175,7 +175,7 @@ func getPeerClient(peerAddr string) *http.Client {
 	}
 	
 	client = &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 3 * time.Second, // Faster timeout for P2P environment
 		Transport: &http.Transport{
 			// Connection pool settings optimized for peer-to-peer usage
 			MaxIdleConns:        config.MaxConnections,
@@ -183,12 +183,12 @@ func getPeerClient(peerAddr string) *http.Client {
 			IdleConnTimeout:     60 * time.Second, // Keep connections longer for efficiency
 			DisableKeepAlives:   false,
 			
-			// Connection establishment timeouts for better responsiveness
+			// Aggressive timeouts for P2P - fail fast on unresponsive peers
 			DialContext: (&net.Dialer{
-				Timeout: 3 * time.Second,
+				Timeout: 1 * time.Second, // Quick connection establishment
 			}).DialContext,
-			TLSHandshakeTimeout: 2 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second,
+			TLSHandshakeTimeout: 1 * time.Second,
+			ResponseHeaderTimeout: 2 * time.Second, // Fast header response
 			
 			// Connection reuse settings
 			MaxConnsPerHost:     3, // Limit concurrent connections per peer
@@ -737,13 +737,11 @@ func udpServer() {
 			if strings.HasPrefix(msg, "has_path?") {
 				hash := strings.TrimPrefix(msg, "has_path?")
 				metrics.UDPQueriesReceived.Add(1)
-				log.Printf("[DEBUG] " + fmt.Sprintf("Received path query from %s for hash: %s", addr, hash))
+				// Reduced logging verbosity - only log successful responses to reduce noise
 				if hasPath(hash) {
 					metrics.UDPQueriesFound.Add(1)
 					log.Printf("[INFO] " + fmt.Sprintf("Responding YES to %s for hash: %s", addr, hash))
 					conn.WriteToUDP([]byte("yes"), addr)
-				} else {
-					log.Printf("[DEBUG] " + fmt.Sprintf("Path not found locally: %s", hash))
 				}
 			} else if msg == "ping" {
 				// Backward compatibility: simple ping/pong
@@ -1583,7 +1581,12 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	resp, err := client.Get(peerURL)
 	if err != nil {
 		metrics.Misses.Add(1)
-		log.Printf("[WARN] " + fmt.Sprintf("Failed to fetch from peer %s: %v", peerAddr.IP, err))
+		// Reduce noise for common timeout errors
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+			log.Printf("[DEBUG] Peer %s timeout for %s", peerAddr.IP, path)
+		} else {
+			log.Printf("[WARN] Failed to fetch from peer %s: %v", peerAddr.IP, err)
+		}
 		http.Error(cw, "Failed to fetch from peer", 502)
 		return
 	}
