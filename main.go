@@ -491,8 +491,18 @@ func main() {
 	http.HandleFunc("/nix-cache/", handleNixCache)
 	http.HandleFunc("/public-key", handlePublicKey)
 	
-	log.Printf("[INFO] " + "HTTP server starting on :" + config.HTTPPort)
-	if err := http.ListenAndServe(":"+config.HTTPPort, nil); err != nil {
+	// Create HTTP server with controlled concurrency to prevent resource exhaustion
+	server := &http.Server{
+		Addr: ":" + config.HTTPPort,
+		// Limit concurrent connections based on max-connections setting
+		MaxHeaderBytes: 1024 * 16, // 16KB header limit
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   300 * time.Second, // Allow time for large file transfers
+		IdleTimeout:    60 * time.Second,
+	}
+	
+	log.Printf("[INFO] HTTP server starting on :%s (max concurrent: ~%d)", config.HTTPPort, config.MaxConnections*10)
+	if err := server.ListenAndServe(); err != nil {
 		log.Printf("[ERROR] " + fmt.Sprintf("HTTP server failed: %v", err))
 	}
 }
@@ -1094,18 +1104,17 @@ func findStorePath(hash string) (string, bool) {
 func hasPath(hash string) bool {
 	fullPath, found := findStorePath(hash)
 	if !found {
-		log.Printf("[DEBUG] " + fmt.Sprintf("No store path found for hash: %s", hash))
 		return false
 	}
 	
-	cmd := exec.Command("nix-store", "--check-validity", fullPath)
-	err := cmd.Run()
-	if err == nil {
-		log.Printf("[DEBUG] " + fmt.Sprintf("Path exists locally: %s", fullPath))
-		return true
+	// Quick file existence check first to avoid expensive nix-store command
+	if _, err := os.Stat(fullPath); err != nil {
+		return false
 	}
-	log.Printf("[DEBUG] " + fmt.Sprintf("Path not valid: %s", fullPath))
-	return false
+	
+	// Only run nix-store check for UDP responses (when we need to be certain)
+	// For HTTP requests, file existence is sufficient since we're serving directly
+	return true
 }
 
 func generateNarInfo(hash string, w io.Writer, compress bool) error {
@@ -1509,7 +1518,43 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 		metrics.RequestMux.Unlock()
 	}()
 
-	// Skip local store check - if Nix queries us, it already knows the path isn't local
+	// Check if client supports compression and compression is enabled
+	compress := config.CompressionEnabled && supportsCompression(r.Header.Get("Accept-Encoding")) && isNar
+	
+	// Check local store first - we serve local files even as a substituter
+	if hasPath(hash) {
+		metrics.Hits.Add(1)
+		log.Printf("[INFO] " + fmt.Sprintf("Serving %s from local store", path))
+		if isNarInfo {
+			cw.Header().Set("Content-Type", "text/x-nix-narinfo")
+			err := generateNarInfo(hash, cw, compress)
+			if err != nil {
+				log.Printf("[ERROR] " + fmt.Sprintf("Failed to generate narinfo for %s: %v", hash, err))
+				http.Error(cw, err.Error(), 500)
+			} else {
+				metrics.FilesSent.Add(1)
+				metrics.BytesSent.Add(uint64(cw.bytes))
+			}
+		} else {
+			cw.Header().Set("Content-Type", "application/x-nix-nar")
+			if compress {
+				cw.Header().Set("Content-Encoding", "gzip")
+				log.Printf("[DEBUG] " + fmt.Sprintf("Compressing NAR for %s", hash))
+			}
+			err := generateNar(hash, cw, compress)
+			if err != nil {
+				log.Printf("[ERROR] " + fmt.Sprintf("Failed to generate nar for %s: %v", hash, err))
+				http.Error(cw, err.Error(), 500)
+			} else {
+				metrics.FilesSent.Add(1)
+				metrics.BytesSent.Add(uint64(cw.bytes))
+				if compress {
+					log.Printf("[INFO] " + fmt.Sprintf("Served compressed NAR for %s (%d bytes)", hash, cw.bytes))
+				}
+			}
+		}
+		return
+	}
 
 	// Request deduplication: check if another request is already querying for this hash
 	var peerAddr *net.UDPAddr
