@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"encoding/json"
+	
+	"github.com/hashicorp/mdns"
 )
 
 // Configuration represents peernix configuration settings
@@ -58,6 +60,9 @@ type Peer struct {
 	Platform     string // OS/arch info
 	Features     []string // Supported features
 	PublicKey    string // Ed25519 public key
+	LastSeen     time.Time // Last successful response
+	FailureCount int // Consecutive failure count
+	ResponseTime time.Duration // Average response time
 }
 
 // DiscoveryMessage represents the enhanced UDP discovery protocol
@@ -95,7 +100,22 @@ var (
 	publicKey    ed25519.PublicKey
 	keyName      = "peernix-1" // Key identifier for signatures
 	signingEnabled = false
+	
+	// Request deduplication
+	pendingRequests = make(map[string]chan *net.UDPAddr)
+	requestsMux     sync.RWMutex
+	
+	// Store operation cache for resource conservation
+	storeCache     = make(map[string]storeResult)
+	storeCacheMux  sync.RWMutex
 )
+
+// storeResult caches nix-store operation results
+type storeResult struct {
+	result    interface{}
+	timestamp time.Time
+	err       error
+}
 
 // getLocalIPs returns all local IP addresses
 func getLocalIPs() []string {
@@ -230,7 +250,7 @@ func createDiscoveryMessage(command string) DiscoveryMessage {
 	msg := DiscoveryMessage{
 		Command:       command,
 		PeernixVersion: "2.0.0", // Version with enhanced discovery
-		Platform:      fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH),
+		Platform:      fmt.Sprintf("%s-%s", runtime.GOARCH, runtime.GOOS),
 		Features:      getSupportedFeatures(),
 		Port:          mustParseInt(config.HTTPPort),
 	}
@@ -442,6 +462,7 @@ func main() {
 	http.HandleFunc("/", handleRoot)
 	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/status", handleStatus)
+	http.HandleFunc("/ping", handlePing)
 	http.HandleFunc("/nix-cache/nix-cache-info", handleNixCacheInfo)
 	http.HandleFunc("/nix-cache/", handleNixCache)
 	http.HandleFunc("/public-key", handlePublicKey)
@@ -549,7 +570,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Peernix Status\n")
 	fmt.Fprintf(w, "==============\n\n")
 	fmt.Fprintf(w, "Version: 2.0.0\n")
-	fmt.Fprintf(w, "Platform: %s-%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(w, "Platform: %s-%s\n", runtime.GOARCH, runtime.GOOS)
 	fmt.Fprintf(w, "Features: %s\n", strings.Join(getSupportedFeatures(), ", "))
 	fmt.Fprintf(w, "Signing: %t\n", signingEnabled)
 	if signingEnabled {
@@ -622,6 +643,11 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[DEBUG] Served status to %s", r.RemoteAddr)
 }
 
+func handlePing(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "pong\n")
+}
+
 func udpServer() {
 	port, _ := strconv.Atoi(config.UDPPort)
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
@@ -637,6 +663,14 @@ func udpServer() {
 		for range time.Tick(config.DiscoveryInterval) {
 			log.Printf("[DEBUG] " + "Running periodic peer discovery")
 			updatePeers()
+		}
+	}()
+	
+	// Start peer health checker
+	go func() {
+		for range time.Tick(2 * time.Minute) {
+			log.Printf("[DEBUG] " + "Running peer health checks")
+			checkPeerHealth()
 		}
 	}()
 
@@ -725,6 +759,8 @@ func udpServer() {
 func updatePeers() {
 	// Run UDP discovery with enhanced protocol
 	go updatePeersUDP()
+	// Run mDNS discovery
+	go updatePeersMDNS()
 }
 
 func updatePeersUDP() {
@@ -830,10 +866,248 @@ func updatePeersUDP() {
 	}
 }
 
-// findStorePath finds the full store path for a given hash
+// updatePeersMDNS discovers peers using mDNS
+func updatePeersMDNS() {
+	// Create entries channel to receive discovered services
+	entriesCh := make(chan *mdns.ServiceEntry, 10)
+	
+	// Start browsing for peernix services
+	go func() {
+		defer close(entriesCh)
+		if err := mdns.Lookup("_peernix._tcp", entriesCh); err != nil {
+			log.Printf("[WARN] mDNS lookup failed: %v", err)
+		}
+	}()
+	
+	// Start advertising our service
+	go func() {
+		// Service info with our capabilities
+		info := []string{
+			fmt.Sprintf("version=%s", "2.0.0"),
+			fmt.Sprintf("platform=%s", fmt.Sprintf("%s-%s", runtime.GOARCH, runtime.GOOS)),
+			fmt.Sprintf("features=%s", strings.Join(getSupportedFeatures(), ",")),
+		}
+		if signingEnabled {
+			publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
+			info = append(info, fmt.Sprintf("pubkey=%s:%s", keyName, publicKeyEncoded))
+		}
+		
+		service, err := mdns.NewMDNSService("peernix", "_peernix._tcp", "", "", mustParseInt(config.HTTPPort), nil, info)
+		if err != nil {
+			log.Printf("[WARN] Failed to create mDNS service: %v", err)
+			return
+		}
+		
+		server, err := mdns.NewServer(&mdns.Config{Zone: service})
+		if err != nil {
+			log.Printf("[WARN] Failed to start mDNS server: %v", err)
+			return
+		}
+		defer server.Shutdown()
+		
+		log.Printf("[INFO] mDNS service advertising started")
+		
+		// Keep advertising for discovery interval duration
+		time.Sleep(config.DiscoveryInterval)
+	}()
+	
+	// Process discovered entries
+	timeout := time.After(5 * time.Second)
+	newPeers := []Peer{}
+	
+	for {
+		select {
+		case entry := <-entriesCh:
+			if entry == nil {
+				continue
+			}
+			
+			// Skip our own service
+			if isLocalIP(entry.Addr.String()) {
+				log.Printf("[DEBUG] Ignoring own mDNS service at %s", entry.Addr)
+				continue
+			}
+			
+			// Parse service info
+			peer := Peer{
+				Addr: entry.Addr.String(),
+				TTL:  time.Now().Add(config.PeerTTL),
+			}
+			
+			// Extract metadata from TXT records
+			for _, txt := range entry.InfoFields {
+				if strings.HasPrefix(txt, "version=") {
+					peer.Version = strings.TrimPrefix(txt, "version=")
+				} else if strings.HasPrefix(txt, "platform=") {
+					peer.Platform = strings.TrimPrefix(txt, "platform=")
+				} else if strings.HasPrefix(txt, "features=") {
+					featuresStr := strings.TrimPrefix(txt, "features=")
+					peer.Features = strings.Split(featuresStr, ",")
+				} else if strings.HasPrefix(txt, "pubkey=") {
+					peer.PublicKey = strings.TrimPrefix(txt, "pubkey=")
+				}
+			}
+			
+			newPeers = append(newPeers, peer)
+			log.Printf("[INFO] Discovered peer via mDNS: %s v%s (%s)", 
+				entry.Addr, peer.Version, strings.Join(peer.Features, ","))
+			
+		case <-timeout:
+			goto merge_peers
+		}
+	}
+	
+merge_peers:
+	// Merge mDNS discovered peers with existing ones  
+	peersMux.Lock()
+	oldCount := len(peers)
+	for _, newPeer := range newPeers {
+		found := false
+		for i, peer := range peers {
+			if peer.Addr == newPeer.Addr {
+				peers[i].TTL = newPeer.TTL
+				peers[i].Version = newPeer.Version
+				peers[i].Platform = newPeer.Platform
+				peers[i].Features = newPeer.Features
+				peers[i].PublicKey = newPeer.PublicKey
+				found = true
+				break
+			}
+		}
+		if !found {
+			peers = append(peers, newPeer)
+		}
+	}
+	peersMux.Unlock()
+	
+	if oldCount != len(peers) {
+		log.Printf("[INFO] mDNS discovery updated peer count: %d", len(peers))
+	}
+}
+
+// checkPeerHealth performs health checks on all known peers
+func checkPeerHealth() {
+	peersMux.RLock()
+	currentPeers := make([]Peer, len(peers))
+	copy(currentPeers, peers)
+	peersMux.RUnlock()
+	
+	if len(currentPeers) == 0 {
+		return
+	}
+	
+	type healthResult struct {
+		addr         string
+		responseTime time.Duration
+		err          error
+	}
+	
+	results := make(chan healthResult, len(currentPeers))
+	
+	// Check each peer concurrently for resource efficiency
+	for _, peer := range currentPeers {
+		go func(peerAddr string) {
+			start := time.Now()
+			client := getPeerClient(peerAddr)
+			resp, err := client.Get(fmt.Sprintf("http://%s:%s/ping", peerAddr, config.HTTPPort))
+			responseTime := time.Since(start)
+			
+			if err != nil {
+				results <- healthResult{peerAddr, 0, err}
+				return
+			}
+			defer resp.Body.Close()
+			
+			if resp.StatusCode == 200 {
+				results <- healthResult{peerAddr, responseTime, nil}
+			} else {
+				results <- healthResult{peerAddr, 0, fmt.Errorf("HTTP %d", resp.StatusCode)}
+			}
+		}(peer.Addr)
+	}
+	
+	// Collect results and update peer status
+	healthyCount := 0
+	for i := 0; i < len(currentPeers); i++ {
+		result := <-results
+		
+		peersMux.Lock()
+		for j, peer := range peers {
+			if peer.Addr == result.addr {
+				if result.err == nil {
+					// Successful health check
+					peers[j].LastSeen = time.Now()
+					peers[j].FailureCount = 0
+					// Update rolling average response time
+					if peers[j].ResponseTime == 0 {
+						peers[j].ResponseTime = result.responseTime
+					} else {
+						peers[j].ResponseTime = (peers[j].ResponseTime + result.responseTime) / 2
+					}
+					healthyCount++
+				} else {
+					// Failed health check
+					peers[j].FailureCount++
+					log.Printf("[WARN] Peer %s health check failed (failures: %d): %v", 
+						result.addr, peers[j].FailureCount, result.err)
+				}
+				break
+			}
+		}
+		peersMux.Unlock()
+	}
+	
+	// Remove peers with too many consecutive failures (resource conservation)
+	peersMux.Lock()
+	activePeers := []Peer{}
+	removedCount := 0
+	for _, peer := range peers {
+		if peer.FailureCount < 3 { // Allow 3 failures before removal
+			activePeers = append(activePeers, peer)
+		} else {
+			removedCount++
+			log.Printf("[INFO] Removing unhealthy peer: %s (failures: %d)", peer.Addr, peer.FailureCount)
+		}
+	}
+	peers = activePeers
+	peersMux.Unlock()
+	
+	if removedCount > 0 {
+		log.Printf("[INFO] Health check completed: %d healthy, %d removed", healthyCount, removedCount)
+	}
+}
+
+// findStorePath finds the full store path for a given hash with caching
 func findStorePath(hash string) (string, bool) {
+	cacheKey := "path:" + hash
+	
+	// Check cache first for resource conservation
+	storeCacheMux.RLock()
+	if cached, exists := storeCache[cacheKey]; exists {
+		if time.Since(cached.timestamp) < 5*time.Minute {
+			storeCacheMux.RUnlock()
+			if cached.err != nil {
+				return "", false
+			}
+			return cached.result.(string), true
+		}
+	}
+	storeCacheMux.RUnlock()
+	
+	// Not in cache or expired, run command
 	cmd := exec.Command("nix", "store", "path-from-hash-part", hash)
 	out, err := cmd.Output()
+	
+	// Cache the result
+	storeCacheMux.Lock()
+	if err != nil {
+		storeCache[cacheKey] = storeResult{"", time.Now(), err}
+	} else {
+		path := strings.TrimSpace(string(out))
+		storeCache[cacheKey] = storeResult{path, time.Now(), nil}
+	}
+	storeCacheMux.Unlock()
+	
 	if err != nil {
 		return "", false
 	}
@@ -986,44 +1260,147 @@ func queryPeersParallel(hash string) *net.UDPAddr {
 	
 	results := make(chan result, len(currentPeers))
 	
-	// Query each peer concurrently
+	// Query each peer concurrently with retry logic
 	for _, peer := range currentPeers {
-		go func(peerAddr string) {
+		go func(p Peer) {
 			defer func() {
 				if r := recover(); r != nil {
 					results <- result{nil, fmt.Errorf("panic in peer query: %v", r)}
 				}
 			}()
 			
-			addr, err := net.ResolveUDPAddr("udp", peerAddr+":"+config.UDPPort)
-			if err != nil {
-				results <- result{nil, err}
-				return
-			}
+			// Retry logic with exponential backoff: immediate, 100ms, 500ms, 2s
+			retryDelays := []time.Duration{0, 100*time.Millisecond, 500*time.Millisecond, 2*time.Second}
 			
-			conn, err := net.DialUDP("udp", nil, addr)
-			if err != nil {
-				results <- result{nil, err}
-				return
+			for attempt := 0; attempt < len(retryDelays); attempt++ {
+				// Check context before each retry
+				select {
+				case <-ctx.Done():
+					results <- result{nil, ctx.Err()}
+					return
+				default:
+				}
+				
+				// Wait for retry delay (except first attempt)
+				if attempt > 0 {
+					select {
+					case <-ctx.Done():
+						results <- result{nil, ctx.Err()}
+						return
+					case <-time.After(retryDelays[attempt]):
+						// Continue with retry
+					}
+				}
+				
+				addr, err := net.ResolveUDPAddr("udp", p.Addr+":"+config.UDPPort)
+				if err != nil {
+					if attempt == len(retryDelays)-1 {
+						// Update failure count on final failure
+						peersMux.Lock()
+						for i := range peers {
+							if peers[i].Addr == p.Addr {
+								peers[i].FailureCount++
+								break
+							}
+						}
+						peersMux.Unlock()
+						results <- result{nil, err}
+						return
+					}
+					continue
+				}
+				
+				conn, err := net.DialUDP("udp", nil, addr)
+				if err != nil {
+					if attempt == len(retryDelays)-1 {
+						// Update failure count on final failure
+						peersMux.Lock()
+						for i := range peers {
+							if peers[i].Addr == p.Addr {
+								peers[i].FailureCount++
+								break
+							}
+						}
+						peersMux.Unlock()
+						results <- result{nil, err}
+						return
+					}
+					continue
+				}
+				
+				conn.SetDeadline(time.Now().Add(1 * time.Second))
+				_, err = conn.Write([]byte("has_path?" + hash))
+				if err != nil {
+					conn.Close()
+					if attempt == len(retryDelays)-1 {
+						// Update failure count on final failure
+						peersMux.Lock()
+						for i := range peers {
+							if peers[i].Addr == p.Addr {
+								peers[i].FailureCount++
+								break
+							}
+						}
+						peersMux.Unlock()
+						results <- result{nil, err}
+						return
+					}
+					continue
+				}
+				
+				buf := make([]byte, 1024)
+				n, _, err := conn.ReadFromUDP(buf)
+				conn.Close()
+				
+				if err != nil {
+					if attempt == len(retryDelays)-1 {
+						// Update failure count on final failure
+						peersMux.Lock()
+						for i := range peers {
+							if peers[i].Addr == p.Addr {
+								peers[i].FailureCount++
+								break
+							}
+						}
+						peersMux.Unlock()
+						results <- result{nil, err}
+						return
+					}
+					continue
+				}
+				
+				if string(buf[:n]) == "yes" {
+					// Update peer health on successful response
+					peersMux.Lock()
+					for i := range peers {
+						if peers[i].Addr == p.Addr {
+							peers[i].LastSeen = time.Now()
+							peers[i].FailureCount = 0
+							break
+						}
+					}
+					peersMux.Unlock()
+					
+					results <- result{addr, nil}
+					return
+				} else if attempt == len(retryDelays)-1 {
+					// Path not found, but peer is healthy
+					peersMux.Lock()
+					for i := range peers {
+						if peers[i].Addr == p.Addr {
+							peers[i].LastSeen = time.Now()
+							peers[i].FailureCount = 0
+							break
+						}
+					}
+					peersMux.Unlock()
+					
+					results <- result{nil, fmt.Errorf("peer doesn't have path")}
+					return
+				}
+				// Path not found, but try again in case of transient issues
 			}
-			defer conn.Close()
-			
-			conn.SetDeadline(time.Now().Add(1 * time.Second))
-			conn.Write([]byte("has_path?" + hash))
-			
-			buf := make([]byte, 1024)
-			n, _, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				results <- result{nil, err}
-				return
-			}
-			
-			if string(buf[:n]) == "yes" {
-				results <- result{addr, nil}
-			} else {
-				results <- result{nil, fmt.Errorf("peer doesn't have path")}
-			}
-		}(peer.Addr)
+		}(peer)
 	}
 	
 	// Wait for first success or all failures
@@ -1049,16 +1426,54 @@ func generateNar(hash string, w io.Writer, compress bool) error {
 		return fmt.Errorf("store path not found for hash: %s", hash)
 	}
 	
-	var writer io.Writer = w
-	if compress {
-		gw := gzip.NewWriter(w)
-		defer gw.Close()
-		writer = gw
+	// Use streaming approach with proper pipe management for resource conservation
+	cmd := exec.Command("nix-store", "--dump", fullPath)
+	
+	// Create a pipe for streaming output
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %v", err)
 	}
 	
-	cmd := exec.Command("nix-store", "--dump", fullPath)
-	cmd.Stdout = writer
-	return cmd.Run()
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start nix-store command: %v", err)
+	}
+	
+	// Handle compression and streaming in a goroutine to avoid blocking
+	var copyErr error
+	done := make(chan struct{})
+	
+	go func() {
+		defer close(done)
+		defer stdout.Close()
+		
+		if compress {
+			// Stream through gzip compressor
+			gw := gzip.NewWriter(w)
+			defer gw.Close()
+			
+			// Use io.Copy for efficient streaming with 32KB buffer
+			_, copyErr = io.Copy(gw, stdout)
+		} else {
+			// Stream directly without compression
+			_, copyErr = io.Copy(w, stdout)
+		}
+	}()
+	
+	// Wait for both streaming and command completion
+	<-done
+	cmdErr := cmd.Wait()
+	
+	// Return the first error encountered
+	if copyErr != nil {
+		return fmt.Errorf("failed to stream NAR: %v", copyErr)
+	}
+	if cmdErr != nil {
+		return fmt.Errorf("nix-store command failed: %v", cmdErr)
+	}
+	
+	return nil
 }
 
 // countingWriter wraps ResponseWriter to count bytes written
@@ -1141,14 +1556,66 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Query peers in parallel
-	log.Printf("[INFO] " + fmt.Sprintf("Querying peers for %s", path))
-	peerAddr := queryPeersParallel(hash)
-	if peerAddr == nil {
-		metrics.Misses.Add(1)
-		log.Printf("[INFO] " + fmt.Sprintf("No peers responded for %s", path))
-		http.Error(cw, "Not found in local store or peers", 404)
-		return
+	// Request deduplication: check if another request is already querying for this hash
+	var peerAddr *net.UDPAddr
+	
+	requestsMux.Lock()
+	if pendingCh, exists := pendingRequests[hash]; exists {
+		// Another request is already in progress, wait for its result
+		requestsMux.Unlock()
+		log.Printf("[DEBUG] Joining existing request for %s", hash)
+		
+		select {
+		case peerAddr = <-pendingCh:
+			if peerAddr == nil {
+				// The other request failed
+				metrics.Misses.Add(1)
+				log.Printf("[INFO] " + fmt.Sprintf("Deduplicated request failed for %s", path))
+				http.Error(cw, "Not found in local store or peers", 404)
+				return
+			}
+			// Use the result from the ongoing request
+			log.Printf("[INFO] Using result from deduplicated request for %s", path)
+		case <-time.After(5*time.Second):
+			// Timeout waiting for deduplicated request
+			metrics.Misses.Add(1)
+			log.Printf("[WARN] Timeout waiting for deduplicated request for %s", path)
+			http.Error(cw, "Request timeout", 504)
+			return
+		}
+	} else {
+		// Create new pending request channel
+		pendingCh := make(chan *net.UDPAddr, 10) // Buffered to handle multiple waiters
+		pendingRequests[hash] = pendingCh
+		requestsMux.Unlock()
+		
+		// Query peers in parallel
+		log.Printf("[INFO] " + fmt.Sprintf("Querying peers for %s", path))
+		peerAddr = queryPeersParallel(hash)
+		
+		// Notify all waiting requests of the result
+		requestsMux.Lock()
+		delete(pendingRequests, hash)
+		requestsMux.Unlock()
+		
+		// Send result to all waiters
+		go func() {
+			defer close(pendingCh)
+			for i := 0; i < cap(pendingCh); i++ {
+				select {
+				case pendingCh <- peerAddr:
+				default:
+					return
+				}
+			}
+		}()
+		
+		if peerAddr == nil {
+			metrics.Misses.Add(1)
+			log.Printf("[INFO] " + fmt.Sprintf("No peers responded for %s", path))
+			http.Error(cw, "Not found in local store or peers", 404)
+			return
+		}
 	}
 	
 	// Fetch from the peer that responded

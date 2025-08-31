@@ -28,7 +28,7 @@
           packages.default = pkgs.buildGoModule {
             name = "org.zw3rk.peernix";
             src = ./.;
-            vendorHash = null;
+            vendorHash = "sha256-YF6kWhL7A3D4j65qm2+G1+DnHo4lGqUPNBoeie/UvNY=";
             subPackages = [ "." ];
             buildInputs = [ ];
             installPhase = ''
