@@ -78,7 +78,6 @@ in
         gid = cfg.gid;
         home = cfg.dataDir;
         createHome = true;
-        isSystemUser = true;
         shell = "/bin/sh";
       }
     ];
