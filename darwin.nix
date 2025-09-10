@@ -33,10 +33,16 @@ in
       description = "User account under which peernix runs.";
     };
 
-    group = mkOption {
-      type = types.str;
-      default = "_peernix";
-      description = "Group under which peernix runs.";
+    uid = mkOption {
+      type = types.nullOr types.int;
+      default = null;
+      description = "Optional UID for the peernix user. If null, no uid is forced.";
+    };
+
+    gid = mkOption {
+      type = types.int;
+      default = 20; # macOS 'staff'
+      description = "Primary GID for the peernix user. We do not create this group; it must already exist (e.g. gid 20 = staff).";
     };
 
     dataDir = mkOption {
@@ -64,36 +70,38 @@ in
   };
 
   config = mkIf cfg.enable {
-    # Create user and group
-    users.users.${cfg.user} = {
-      description = "peernix service user";
-      group = cfg.group;
-      home = cfg.dataDir;
-      createHome = true;
-      shell = "/bin/sh";
-    };
-
-    users.groups.${cfg.group} = {};
+    # Create user
+    users.users.${cfg.user} = lib.mkMerge [
+      (lib.optionalAttrs (cfg.uid != null) { uid = cfg.uid; })
+      {
+        description = "peernix service user";
+        gid = cfg.gid;
+        home = cfg.dataDir;
+        createHome = true;
+        isSystemUser = true;
+        shell = "/bin/sh";
+      }
+    ];
 
     # Ensure data directory exists with correct permissions
     system.activationScripts.peernix = ''
       mkdir -p ${cfg.dataDir}
-      chown ${cfg.user}:${cfg.group} ${cfg.dataDir}
+      chown ${cfg.user}:${toString cfg.gid} ${cfg.dataDir}
       chmod 755 ${cfg.dataDir}
     '';
 
     # Configure launchd service
-    launchd.agents.peernix = {
+    launchd.daemons.peernix = {
       enable = true;
-      config = {
-        ProgramArguments = [ "${cfg.package}/bin/peernix" ];
+      script = ''
+        exec ${cfg.package}/bin/peernix
+      '';
+      serviceConfig = {
         WorkingDirectory = cfg.dataDir;
-        StandardOutPath = "${cfg.dataDir}/peernix.log";
-        StandardErrorPath = "${cfg.dataDir}/peernix.log";
+        StandardOutPath = "/var/log/peernix.log";
+        StandardErrorPath = "/var/log/peernix.log";
         KeepAlive = true;
         RunAtLoad = true;
-        
-        # Set environment variables
         EnvironmentVariables = {
           PATH = "${pkgs.nix}/bin:${pkgs.coreutils}/bin:/usr/bin:/bin";
         };
@@ -109,11 +117,10 @@ in
       };
     };
 
-    # Install configuration file
     system.activationScripts.peernix-config = ''
       if [ ${builtins.toString (builtins.length (builtins.attrNames cfg.settings))} -gt 0 ]; then
         cp ${configFile} ${cfg.dataDir}/peernix.conf
-        chown ${cfg.user}:${cfg.group} ${cfg.dataDir}/peernix.conf
+        chown ${cfg.user}:${toString cfg.gid} ${cfg.dataDir}/peernix.conf
         chmod 644 ${cfg.dataDir}/peernix.conf
       fi
     '';
