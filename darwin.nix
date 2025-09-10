@@ -131,7 +131,6 @@ in
     
     # Add to nix configuration automatically
     nix.settings = mkIf (cfg.settings ? "http-port") {
-      extra-substituters = [ "http://localhost:${toString cfg.settings."http-port"}/nix-cache/" ];
       extra-trusted-substituters = [ "http://localhost:${toString cfg.settings."http-port"}/nix-cache/" ];
     };
   };
