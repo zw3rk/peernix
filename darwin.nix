@@ -90,7 +90,6 @@ in
 
     # Configure launchd service
     launchd.daemons.peernix = {
-      enable = true;
       script = ''
         exec ${cfg.package}/bin/peernix
       '';
