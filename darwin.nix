@@ -82,13 +82,6 @@ in
     ];
     users.knownUsers = ["${cfg.user}"];
 
-    # Ensure data directory exists with correct permissions
-    system.activationScripts.postActivation.text = ''
-      mkdir -p ${cfg.dataDir}
-      chown ${cfg.user}:${toString cfg.gid} ${cfg.dataDir}
-      chmod 755 ${cfg.dataDir}
-    '';
-
     # Configure launchd service
     launchd.daemons.peernix = {
       script = ''
@@ -97,8 +90,8 @@ in
       serviceConfig = {
         UserName = cfg.user;
         WorkingDirectory = cfg.dataDir;
-        StandardOutPath = "/var/log/peernix.log";
-        StandardErrorPath = "/var/log/peernix.log";
+        StandardOutPath = "${cfg.dataDir}/peernix.log";
+        StandardErrorPath = "${cfg.dataDir}/peernix.log";
         KeepAlive = true;
         RunAtLoad = true;
         EnvironmentVariables = {
