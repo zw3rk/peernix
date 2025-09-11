@@ -96,8 +96,6 @@ in
       '';
       serviceConfig = {
         UserName = cfg.user;
-        GroupName = builtins.toString cfg.gid;
-
         WorkingDirectory = cfg.dataDir;
         StandardOutPath = "/var/log/peernix.log";
         StandardErrorPath = "/var/log/peernix.log";
