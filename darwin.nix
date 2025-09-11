@@ -90,7 +90,9 @@ in
 
     # Configure launchd service
     launchd.daemons.peernix = {
-      program = "${cfg.package}/bin/peernix";
+      script = ''
+        exec ${cfg.package}/bin/peernix
+      '';
       serviceConfig = {
         WorkingDirectory = cfg.dataDir;
         StandardOutPath = "/var/log/peernix.log";
