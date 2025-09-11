@@ -7,7 +7,7 @@ with lib;
 
 let
   cfg = config.services.peernix;
-  
+
   configFile = pkgs.writeText "peernix.conf" (
     lib.concatStringsSep "\n" (
       lib.mapAttrsToList (name: value:
@@ -80,9 +80,10 @@ in
         shell = "/bin/sh";
       }
     ];
+    users.knownUsers = ["${cfg.user}"];
 
     # Ensure data directory exists with correct permissions
-    system.activationScripts.peernix = ''
+    system.activationScripts.postActivation.text = ''
       mkdir -p ${cfg.dataDir}
       chown ${cfg.user}:${toString cfg.gid} ${cfg.dataDir}
       chmod 755 ${cfg.dataDir}
@@ -94,6 +95,9 @@ in
         exec ${cfg.package}/bin/peernix
       '';
       serviceConfig = {
+        UserName = cfg.user;
+        GroupName = builtins.toString cfg.gid;
+
         WorkingDirectory = cfg.dataDir;
         StandardOutPath = "/var/log/peernix.log";
         StandardErrorPath = "/var/log/peernix.log";
@@ -102,10 +106,10 @@ in
         EnvironmentVariables = {
           PATH = "${pkgs.nix}/bin:${pkgs.coreutils}/bin:/usr/bin:/bin";
         };
-        
+
         # Network service dependencies
         WatchPaths = [ cfg.dataDir ];
-        
+
         # Resource limits
         SoftResourceLimits = {
           NumberOfFiles = 1024;
@@ -125,10 +129,10 @@ in
     # Open firewall ports if enabled
     # Note: macOS doesn't have declarative firewall config like NixOS
     # Users need to manually configure Application Firewall or pfctl
-    
+
     # Add helpful environment setup
     environment.systemPackages = [ cfg.package ];
-    
+
     # Add to nix configuration automatically
     nix.settings = mkIf (cfg.settings ? "http-port") {
       extra-trusted-substituters = [ "http://localhost:${toString cfg.settings."http-port"}/nix-cache/" ];
