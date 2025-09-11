@@ -91,7 +91,7 @@ in
     # Configure launchd service
     launchd.daemons.peernix = {
       script = ''
-        exec /nix/launcher ${cfg.package}/bin/peernix
+        exec ${cfg.package}/bin/peernix
       '';
       serviceConfig = {
         WorkingDirectory = cfg.dataDir;
