@@ -201,7 +201,7 @@ func getPeerClient(peerAddr string) *http.Client {
 	return client
 }
 
-// initializeSigning sets up Ed25519 signing keys
+// initializeSigning sets up Ed25519 signing keys and writes nix.peernix.conf
 func initializeSigning() error {
 	keyFile := config.KeyFile
 	keyName = config.KeyName
@@ -213,7 +213,7 @@ func initializeSigning() error {
 			publicKey = signingKey.Public().(ed25519.PublicKey)
 			signingEnabled = true
 			log.Printf("[INFO] Loaded existing signing key from %s", keyFile)
-			return nil
+			return writePeernixConf()
 		}
 	}
 	
@@ -233,6 +233,28 @@ func initializeSigning() error {
 	signingKey = privateKey
 	publicKey = privateKey.Public().(ed25519.PublicKey)
 	signingEnabled = true
+	return writePeernixConf()
+}
+
+// writePeernixConf writes a standalone nix config fragment for peernix
+func writePeernixConf() error {
+	substituterURL := fmt.Sprintf("http://localhost:%s/nix-cache/", config.HTTPPort)
+	confFile := "/etc/nix/nix.peernix.conf"
+	
+	var b strings.Builder
+	fmt.Fprintf(&b, "extra-substituters = %s\n", substituterURL)
+	fmt.Fprintf(&b, "extra-trusted-substituters = %s\n", substituterURL)
+	
+	if signingEnabled {
+		publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
+		fmt.Fprintf(&b, "extra-trusted-public-keys = %s:%s\n", keyName, publicKeyEncoded)
+	}
+	
+	if err := os.WriteFile(confFile, []byte(b.String()), 0644); err != nil {
+		return fmt.Errorf("failed to write %s: %v", confFile, err)
+	}
+	
+	log.Printf("[INFO] Wrote peernix config fragment to %s (add `!include %s` in nix.conf)", confFile, confFile)
 	return nil
 }
 
@@ -389,48 +411,42 @@ func detectNixDaemon() string {
 	return "sudo launchctl kickstart -k system/org.nixos.nix-daemon"
 }
 
-// checkNixConfig checks if peernix is configured as a substituter
+// checkNixConfig checks if peernix is configured as a substituter and trusted key
 func checkNixConfig() {
 	substituterURL := fmt.Sprintf("http://localhost:%s/nix-cache/", config.HTTPPort)
 	
+	// Check substituters
 	cmd := exec.Command("nix", "config", "show", "substituters")
 	output, err := cmd.Output()
 	if err != nil {
 		log.Printf("[WARN] Failed to check nix config: %v", err)
 		return
 	}
+	hasSubstituter := strings.Contains(string(output), substituterURL)
 	
-	if !strings.Contains(string(output), substituterURL) {
-		log.Printf("[WARN] ========================================")
-		log.Printf("[WARN] peernix is not configured as a substituter!")
-		log.Printf("[WARN] To enable peernix, add the following to your nix configuration:")
-		log.Printf("[WARN] ")
-		
-		// Check which config file to use
-		configFile := "/etc/nix/nix.conf"
-		if _, err := os.Stat("/etc/nix/nix.custom.conf"); err == nil {
-			configFile = "/etc/nix/nix.custom.conf"
-		}
-		
-		log.Printf("[WARN] In %s add:", configFile)
-		log.Printf("[WARN]   extra-substituters = %s", substituterURL)
-		log.Printf("[WARN]   extra-trusted-substituters = %s", substituterURL)
-		
-		// Add public key if signing is enabled
-		if signingEnabled {
-			publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
-			log.Printf("[WARN]   extra-trusted-public-keys = %s:%s", keyName, publicKeyEncoded)
-		}
-		
-		log.Printf("[WARN] ")
-		
-		// Detect and provide appropriate daemon restart command
-		daemonRestartCmd := detectNixDaemon()
-		log.Printf("[WARN] Then restart the nix daemon:")
-		log.Printf("[WARN]   %s", daemonRestartCmd)
-		log.Printf("[WARN] ========================================")
-	} else {
+	// Check trusted-public-keys
+	cmd = exec.Command("nix", "config", "show", "trusted-public-keys")
+	keyOutput, err := cmd.Output()
+	if err != nil {
+		log.Printf("[WARN] Failed to check nix trusted-public-keys: %v", err)
+		return
+	}
+	hasTrustedKey := true
+	if signingEnabled {
+		publicKeyEncoded := base64.StdEncoding.EncodeToString(publicKey)
+		expectedKey := fmt.Sprintf("%s:%s", keyName, publicKeyEncoded)
+		hasTrustedKey = strings.Contains(string(keyOutput), expectedKey)
+	}
+	
+	if hasSubstituter && hasTrustedKey {
 		log.Printf("[INFO] peernix is configured as a substituter ✓")
+	} else {
+		log.Printf("[WARN] ========================================")
+		log.Printf("[WARN] peernix is not fully configured!")
+		log.Printf("[WARN] To enable peernix, ensure your nix.conf contains:")
+		log.Printf("[WARN]   !include /etc/nix/nix.peernix.conf")
+		log.Printf("[WARN] Then restart the nix daemon: %s", detectNixDaemon())
+		log.Printf("[WARN] ========================================")
 	}
 }
 
