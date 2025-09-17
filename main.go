@@ -239,7 +239,7 @@ func initializeSigning() error {
 // writePeernixConf writes a standalone nix config fragment for peernix
 func writePeernixConf() error {
 	substituterURL := fmt.Sprintf("http://localhost:%s/nix-cache/", config.HTTPPort)
-	confFile := "/etc/nix/nix.peernix.conf"
+	confFile := "nix.peernix.conf"
 	
 	var b strings.Builder
 	fmt.Fprintf(&b, "extra-substituters = %s\n", substituterURL)
