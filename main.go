@@ -1241,8 +1241,8 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	if signingEnabled {
 		// See ValidPathInfo::fingerprint in nix source file src/libstore/path-info.cc
 
-		// References must be comma-separated (Nix uses comma separation)
-		references := strings.Join(refNames, ",")
+		// References must be comma-separated
+		references := strings.Join(refPaths, ",")
 
 		// Build fingerprint-style content to sign:
 		// "1;{storePath};{narHash};{narSize};{refs}"
