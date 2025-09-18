@@ -1237,7 +1237,7 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 		// Build fingerprint-style content to sign:
 		// "1;{storePath};{narHash};{narSize};{refs}"
 		// NOTE: narHash should be formatted the same way Nix does.
-		content := fmt.Sprintf("1;%s;%s;%s;%s", fullPath, narHash, narSizeStr, refs)
+		content := fmt.Sprintf("1;%s;%s;%s;%s", fullPath, narHash, strings.TrimSpace(string(size)), refs)
 		
 		signature := signNarInfo(content)
 		_, err = w.Write([]byte("Sig: " + signature + "\n"))
