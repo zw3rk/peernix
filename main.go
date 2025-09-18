@@ -1229,17 +1229,15 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	
 	// Add signature if signing is enabled
 	if signingEnabled {
-		// Build the content to sign (everything except the signature) with corrected field formats
-		content := fmt.Sprintf("StorePath: %s\nURL: %s\nCompression: %s\nFileHash: %s\nFileSize: %s\nNarHash: %s\nNarSize: %s\nReferences: %s\nDeriver: %s\n",
-			fullPath,
-			url,
-			compression,
-			fileHash,
-			fileSize,
-			narHash,
-			strings.TrimSpace(string(size)),
-			strings.Join(refNames, " "),
-			deriverName)
+		// See ValidPathInfo::fingerprint in nix source file src/libstore/path-info.cc
+		
+		// References must be comma-separated (Nix uses comma separation)
+		refs := strings.Join(refNames, ",")
+		
+		// Build fingerprint-style content to sign:
+		// "1;{storePath};{narHash};{narSize};{refs}"
+		// NOTE: narHash should be formatted the same way Nix does.
+		content := fmt.Sprintf("1;%s;%s;%s;%s", fullPath, narHash, narSizeStr, refs)
 		
 		signature := signNarInfo(content)
 		_, err = w.Write([]byte("Sig: " + signature + "\n"))
