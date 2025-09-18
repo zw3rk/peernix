@@ -1128,6 +1128,12 @@ func hasPath(hash string) bool {
 		return false
 	}
 	
+	// Also check for lock file
+	if _, err := os.Stat(fullPath + ".lock"); err == nil {
+		// lock file exists
+		return false
+	}
+	
 	// Only run nix-store check for UDP responses (when we need to be certain)
 	// For HTTP requests, file existence is sufficient since we're serving directly
 	return true
