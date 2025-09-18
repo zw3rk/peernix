@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"sort"
 
 	"encoding/json"
 
@@ -1218,6 +1219,9 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	}
 	// Process references to remove /nix/store/ prefix
 	refPaths := strings.Fields(strings.TrimSpace(string(refs)))
+	// Output of `nix-store --query --requisites` does not seem to be
+	// sorted, but `narinfo` do seem to be sorted (and fingerprint needs to be).
+	sort.Strings(refPaths)
 	refNames := make([]string, len(refPaths))
 	for i, refPath := range refPaths {
 		refNames[i] = strings.TrimPrefix(refPath, "/nix/store/")
