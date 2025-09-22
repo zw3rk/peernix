@@ -243,7 +243,7 @@ signingKey = privateKey
 
 // writePeernixConf writes a standalone nix config fragment for peernix
 func writePeernixConf() error {
-	substituterURL := fmt.Sprintf("http://localhost:%s/nix-cache/", config.HTTPPort)
+	substituterURL := fmt.Sprintf("http://localhost:%s/nix-cache/?trusted=1", config.HTTPPort)
 	confFile := "nix.peernix.conf"
 
 	var b strings.Builder
