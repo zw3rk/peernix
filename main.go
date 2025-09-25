@@ -38,6 +38,7 @@ type Config struct {
 	PeerTTL           time.Duration `conf:"peer-ttl"`
 	CompressionEnabled bool         `conf:"compression-enabled"`
 	MaxConnections    int           `conf:"max-connections"`
+	RequestTimeout    time.Duration `conf:"request-timeout"`
 }
 
 // Default configuration
@@ -51,6 +52,7 @@ var config = Config{
 	PeerTTL:           2 * time.Minute,
 	CompressionEnabled: true,
 	MaxConnections:    100,
+	RequestTimeout:    5 * time.Minute, // Allow 5 minutes for large file transfers
 }
 
 type Peer struct {
@@ -180,7 +182,7 @@ func getPeerClient(peerAddr string) *http.Client {
 	}
 
 	client = &http.Client{
-		Timeout: 3 * time.Second, // Faster timeout for P2P environment
+		Timeout: config.RequestTimeout, // Configurable timeout for large file transfers
 		Transport: &http.Transport{
 			// Connection pool settings optimized for peer-to-peer usage
 			MaxIdleConns:        config.MaxConnections,
@@ -202,7 +204,7 @@ func getPeerClient(peerAddr string) *http.Client {
 	}
 
 	peerClients[peerAddr] = client
-	log.Printf("[DEBUG] Created HTTP client for peer %s", peerAddr)
+	log.Printf("[DEBUG] Created HTTP client for peer %s with timeout %v", peerAddr, config.RequestTimeout)
 	return client
 }
 
@@ -388,13 +390,19 @@ func loadConfig() error {
 			} else {
 				log.Printf("[WARN] Invalid max-connections: %s", value)
 			}
+		case "request-timeout":
+			if duration, err := time.ParseDuration(value); err == nil {
+				config.RequestTimeout = duration
+			} else {
+				log.Printf("[WARN] Invalid request-timeout: %s", value)
+			}
 		default:
 			log.Printf("[WARN] Unknown config key: %s", key)
 		}
 	}
 
-	log.Printf("[INFO] Configuration loaded: UDP=%s HTTP=%s Signing=%t Compression=%t",
-		config.UDPPort, config.HTTPPort, config.SigningEnabled, config.CompressionEnabled)
+	log.Printf("[INFO] Configuration loaded: UDP=%s HTTP=%s Signing=%t Compression=%t RequestTimeout=%v",
+		config.UDPPort, config.HTTPPort, config.SigningEnabled, config.CompressionEnabled, config.RequestTimeout)
 	return nil
 }
 
