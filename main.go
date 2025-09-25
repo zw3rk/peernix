@@ -38,6 +38,7 @@ type Config struct {
 	PeerTTL           time.Duration `conf:"peer-ttl"`
 	CompressionEnabled bool         `conf:"compression-enabled"`
 	MaxConnections    int           `conf:"max-connections"`
+	RequestTimeout    time.Duration `conf:"request-timeout"`
 }
 
 // Default configuration
@@ -51,6 +52,7 @@ var config = Config{
 	PeerTTL:           2 * time.Minute,
 	CompressionEnabled: true,
 	MaxConnections:    100,
+	RequestTimeout:    5 * time.Minute, // Allow 5 minutes for large file transfers
 }
 
 type Peer struct {
@@ -180,7 +182,7 @@ func getPeerClient(peerAddr string) *http.Client {
 	}
 
 	client = &http.Client{
-		Timeout: 3 * time.Second, // Faster timeout for P2P environment
+		Timeout: config.RequestTimeout, // Configurable timeout for large file transfers
 		Transport: &http.Transport{
 			// Connection pool settings optimized for peer-to-peer usage
 			MaxIdleConns:        config.MaxConnections,
@@ -202,7 +204,7 @@ func getPeerClient(peerAddr string) *http.Client {
 	}
 
 	peerClients[peerAddr] = client
-	log.Printf("[DEBUG] Created HTTP client for peer %s", peerAddr)
+	log.Printf("[DEBUG] Created HTTP client for peer %s with timeout %v", peerAddr, config.RequestTimeout)
 	return client
 }
 
@@ -388,13 +390,19 @@ func loadConfig() error {
 			} else {
 				log.Printf("[WARN] Invalid max-connections: %s", value)
 			}
+		case "request-timeout":
+			if duration, err := time.ParseDuration(value); err == nil {
+				config.RequestTimeout = duration
+			} else {
+				log.Printf("[WARN] Invalid request-timeout: %s", value)
+			}
 		default:
 			log.Printf("[WARN] Unknown config key: %s", key)
 		}
 	}
 
-	log.Printf("[INFO] Configuration loaded: UDP=%s HTTP=%s Signing=%t Compression=%t",
-		config.UDPPort, config.HTTPPort, config.SigningEnabled, config.CompressionEnabled)
+	log.Printf("[INFO] Configuration loaded: UDP=%s HTTP=%s Signing=%t Compression=%t RequestTimeout=%v",
+		config.UDPPort, config.HTTPPort, config.SigningEnabled, config.CompressionEnabled, config.RequestTimeout)
 	return nil
 }
 
@@ -524,7 +532,7 @@ func main() {
 
 	log.Printf("[INFO] HTTP server starting on :%s (max concurrent: ~%d)", config.HTTPPort, config.MaxConnections*10)
 	if err := server.ListenAndServe(); err != nil {
-		log.Printf("[ERROR] " + fmt.Sprintf("HTTP server failed: %v", err))
+		log.Printf("[ERROR] HTTP server failed: %v", err)
 	}
 }
 
@@ -723,12 +731,12 @@ func udpServer() {
 	port, _ := strconv.Atoi(config.UDPPort)
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 	if err != nil {
-		log.Printf("[ERROR] " + fmt.Sprintf("Failed to start UDP server: %v", err))
+		log.Printf("[ERROR] Failed to start UDP server: %v", err)
 		return
 	}
 	defer conn.Close()
 	conn.SetWriteBuffer(1024)
-	log.Printf("[INFO] " + "UDP server started on :" + config.UDPPort)
+	log.Printf("[INFO] UDP server started on :%s", config.UDPPort)
 
 	// Announce presence immediately on startup
 	log.Printf("[INFO] " + "Running initial peer discovery")
@@ -738,7 +746,7 @@ func udpServer() {
 	go func() {
 		for i := 0; i < 2; i++ {
 			time.Sleep(5 * time.Second)
-			log.Printf("[INFO] " + fmt.Sprintf("Running initial discovery %d/2", i+1))
+			log.Printf("[INFO] Running initial discovery %d/2", i+1)
 			updatePeers()
 		}
 		log.Printf("[INFO] " + "Initial discovery phase completed")
@@ -759,7 +767,7 @@ func udpServer() {
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("[WARN] " + fmt.Sprintf("UDP read error: %v", err))
+			log.Printf("[WARN] UDP read error: %v", err)
 			continue
 		}
 
@@ -771,15 +779,15 @@ func udpServer() {
 				// Reduced logging verbosity - only log successful responses to reduce noise
 				if hasPath(hash) {
 					metrics.UDPQueriesFound.Add(1)
-					log.Printf("[INFO] " + fmt.Sprintf("Responding YES to %s for hash: %s", addr, hash))
+					log.Printf("[INFO] Responding YES to %s for hash: %s", addr, hash)
 					conn.WriteToUDP([]byte("yes"), addr)
 				}
 			} else if msg == "ping" {
 				// Backward compatibility: simple ping/pong
 				if isLocalIP(addr.IP.String()) {
-					log.Printf("[DEBUG] " + fmt.Sprintf("Ignoring ping from self (%s)", addr))
+					log.Printf("[DEBUG] Ignoring ping from self (%s)", addr)
 				} else {
-					log.Printf("[DEBUG] " + fmt.Sprintf("Received ping from %s, sending pong", addr))
+					log.Printf("[DEBUG] Received ping from %s, sending pong", addr)
 					conn.WriteToUDP([]byte("pong"), addr)
 				}
 			} else if strings.HasPrefix(msg, "{") {
@@ -831,7 +839,7 @@ func udpServer() {
 					}
 				}
 			} else {
-				log.Printf("[DEBUG] " + fmt.Sprintf("Unknown UDP message from %s: %s", addr, msg))
+				log.Printf("[DEBUG] Unknown UDP message from %s: %s", addr, msg)
 			}
 		}(string(buf[:n]), addr)
 	}
@@ -847,13 +855,13 @@ func updatePeers() {
 func updatePeersUDP() {
 	addr, err := net.ResolveUDPAddr("udp", "255.255.255.255:"+config.UDPPort)
 	if err != nil {
-		log.Printf("[WARN] " + fmt.Sprintf("Failed to resolve broadcast address: %v", err))
+		log.Printf("[WARN] Failed to resolve broadcast address: %v", err)
 		return
 	}
 
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		log.Printf("[WARN] " + fmt.Sprintf("Failed to dial UDP broadcast: %v", err))
+		log.Printf("[WARN] Failed to dial UDP broadcast: %v", err)
 		return
 	}
 	defer conn.Close()
@@ -962,7 +970,7 @@ func updatePeersUDP() {
 	}
 
 	if oldCount != len(peers) {
-		log.Printf("[INFO] " + fmt.Sprintf("Active peer count: %d", len(peers)))
+		log.Printf("[INFO] Active peer count: %d", len(peers))
 	}
 }
 

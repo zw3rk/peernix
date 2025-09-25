@@ -17,6 +17,7 @@ peer-ttl = 10m
 # Performance settings
 compression-enabled = true
 max-connections = 10
+request-timeout = 5m
 
 # Examples with different values:
 # udp-port = 8888
@@ -26,3 +27,4 @@ max-connections = 10
 # peer-ttl = 5m
 # compression-enabled = false
 # max-connections = 20
+# request-timeout = 10m

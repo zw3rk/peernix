@@ -61,6 +61,7 @@ in
         "discovery-interval" = "5m";
         "peer-ttl" = "10m";
         "max-connections" = 10;
+        "request-timeout" = "5m";
       };
       example = {
         "udp-port" = 9999;
@@ -70,6 +71,7 @@ in
         "discovery-interval" = "5m";
         "peer-ttl" = "10m";
         "max-connections" = 20;
+        "request-timeout" = "10m";
       };
       description = ''
         Configuration options for peernix in nix.conf format.
