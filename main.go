@@ -1158,22 +1158,49 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 		return fmt.Errorf("store path not found for hash: %s", hash)
 	}
 
+	// Re-verify path exists to catch TOCTOU race with GC
+	// This protects against: cached path exists → GC deletes → we try to use it
+	if _, err := os.Stat(fullPath); err != nil {
+		// Path was deleted (likely by GC), invalidate cache
+		storeCacheMux.Lock()
+		delete(storeCache, "path:"+hash)
+		storeCacheMux.Unlock()
+		return fmt.Errorf("store path no longer exists (GC?): %s", hash)
+	}
+
+	// Also check for lock file - path might be in process of being deleted
+	if _, err := os.Stat(fullPath + ".lock"); err == nil {
+		return fmt.Errorf("store path is locked (GC in progress?): %s", hash)
+	}
+
 	// Get all required info from nix-store
 	cmd := exec.Command("nix-store", "--query", "--requisites", fullPath)
 	refs, err := cmd.Output()
 	if err != nil {
+		// nix-store command failed, invalidate cache
+		storeCacheMux.Lock()
+		delete(storeCache, "path:"+hash)
+		storeCacheMux.Unlock()
 		return err
 	}
 
 	cmd = exec.Command("nix-store", "--query", "--deriver", fullPath)
 	deriver, err := cmd.Output()
 	if err != nil {
+		// nix-store command failed, invalidate cache
+		storeCacheMux.Lock()
+		delete(storeCache, "path:"+hash)
+		storeCacheMux.Unlock()
 		return err
 	}
 
 	cmd = exec.Command("nix-store", "--query", "--size", fullPath)
 	size, err := cmd.Output()
 	if err != nil {
+		// nix-store command failed, invalidate cache
+		storeCacheMux.Lock()
+		delete(storeCache, "path:"+hash)
+		storeCacheMux.Unlock()
 		return err
 	}
 
@@ -1181,6 +1208,10 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	cmd = exec.Command("nix-store", "--query", "--hash", fullPath)
 	narHashOutput, err := cmd.Output()
 	if err != nil {
+		// nix-store command failed, invalidate cache
+		storeCacheMux.Lock()
+		delete(storeCache, "path:"+hash)
+		storeCacheMux.Unlock()
 		return err
 	}
 	narHash := strings.TrimSpace(string(narHashOutput))
@@ -1462,6 +1493,21 @@ func generateNar(hash string, w io.Writer, compress bool) error {
 		return fmt.Errorf("store path not found for hash: %s", hash)
 	}
 
+	// Re-verify path exists to catch TOCTOU race with GC
+	// This protects against: cached path exists → GC deletes → we try to use it
+	if _, err := os.Stat(fullPath); err != nil {
+		// Path was deleted (likely by GC), invalidate cache
+		storeCacheMux.Lock()
+		delete(storeCache, "path:"+hash)
+		storeCacheMux.Unlock()
+		return fmt.Errorf("store path no longer exists (GC?): %s", hash)
+	}
+
+	// Also check for lock file - path might be in process of being deleted
+	if _, err := os.Stat(fullPath + ".lock"); err == nil {
+		return fmt.Errorf("store path is locked (GC in progress?): %s", hash)
+	}
+
 	// Use streaming approach with proper pipe management for resource conservation
 	cmd := exec.Command("nix-store", "--dump", fullPath)
 
@@ -1503,9 +1549,17 @@ func generateNar(hash string, w io.Writer, compress bool) error {
 
 	// Return the first error encountered
 	if copyErr != nil {
+		// Streaming failed, invalidate cache
+		storeCacheMux.Lock()
+		delete(storeCache, "path:"+hash)
+		storeCacheMux.Unlock()
 		return fmt.Errorf("failed to stream NAR: %v", copyErr)
 	}
 	if cmdErr != nil {
+		// nix-store command failed, invalidate cache
+		storeCacheMux.Lock()
+		delete(storeCache, "path:"+hash)
+		storeCacheMux.Unlock()
 		return fmt.Errorf("nix-store command failed: %v", cmdErr)
 	}
 
