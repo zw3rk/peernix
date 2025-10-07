@@ -1623,6 +1623,12 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 			} else {
 				metrics.FilesSent.Add(1)
 				metrics.BytesSent.Add(uint64(cw.bytes))
+				
+				// Cache "localhost" marker so .nar requests know this was served locally
+				// This allows fallback to peers if path is deleted later (e.g., by GC)
+				narInfoPeerCacheMux.Lock()
+				narInfoPeerCache[hash] = "localhost"
+				narInfoPeerCacheMux.Unlock()
 			}
 		} else {
 			cw.Header().Set("Content-Type", "application/x-nix-nar")
@@ -1654,7 +1660,26 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 		peerIP, exists = narInfoPeerCache[hash]
 		narInfoPeerCacheMux.RUnlock()
 		if exists {
-			log.Printf("[INFO] Found cached peer %s for .nar request of hash %s", peerIP, hash)
+			// If cached peer is "localhost" but we're here, path was deleted (likely by GC)
+			// Fall back to querying peers
+			if peerIP == "localhost" {
+				log.Printf("[INFO] Path was served locally but no longer in store, querying peers for hash %s", hash)
+				peerAddr := findPeerForHash(hash)
+				if peerAddr == nil {
+					metrics.Misses.Add(1)
+					log.Printf("[INFO] No peers found for %s after local deletion", path)
+					http.Error(cw, "Not found in local store or peers", 404)
+					return
+				}
+				peerIP = peerAddr.IP.String()
+				// Update cache with actual peer
+				narInfoPeerCacheMux.Lock()
+				narInfoPeerCache[hash] = peerIP
+				narInfoPeerCacheMux.Unlock()
+				log.Printf("[INFO] Found peer %s for .nar request of hash %s (fallback after local deletion)", peerIP, hash)
+			} else {
+				log.Printf("[INFO] Found cached peer %s for .nar request of hash %s", peerIP, hash)
+			}
 		} else {
 			log.Printf("[WARN] No cached peer for .nar hash %s. Refusing to query network to avoid hash mismatch.", hash)
 			http.Error(cw, "Not found, peer for .nar not cached", 404)
