@@ -1159,7 +1159,7 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	}
 
 	// Get all required info from nix-store
-	cmd := exec.Command("nix-store", "--query", "--requisites", fullPath)
+	cmd := exec.Command("nix-store", "--query", "--references", fullPath)
 	refs, err := cmd.Output()
 	if err != nil {
 		return err
@@ -1227,8 +1227,7 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	}
 	// Process references to remove /nix/store/ prefix
 	refPaths := strings.Fields(strings.TrimSpace(string(refs)))
-	// Output of `nix-store --query --requisites` does not seem to be
-	// sorted, but `narinfo` do seem to be sorted (and fingerprint needs to be).
+	// Just in case the output of `nix-store --query --references` is not sorted.
 	sort.Strings(refPaths)
 	refNames := make([]string, len(refPaths))
 	for i, refPath := range refPaths {
