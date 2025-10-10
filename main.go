@@ -1227,6 +1227,14 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	}
 	// Process references to remove /nix/store/ prefix
 	refPaths := strings.Fields(strings.TrimSpace(string(refs)))
+	// Exclude references that point to the store path itself
+	filteredRefPaths := make([]string, 0, len(refPaths))
+	for _, refPath := range refPaths {
+		if refPath != fullPath {
+			filteredRefPaths = append(filteredRefPaths, refPath)
+		}
+	}
+	refPaths = filteredRefPaths
 	// Just in case the output of `nix-store --query --references` is not sorted.
 	sort.Strings(refPaths)
 	refNames := make([]string, len(refPaths))
