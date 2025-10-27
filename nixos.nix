@@ -7,7 +7,6 @@ with lib;
 
 let
   cfg = config.services.peernix;
-  peernix = pkgs.callPackage ./. {};
   
   configFile = pkgs.writeText "peernix.conf" (
     lib.concatStringsSep "\n" (
@@ -23,7 +22,7 @@ in
 
     package = mkOption {
       type = types.package;
-      default = peernix;
+      default = pkgs.peernix;
       description = "The peernix package to use.";
     };
 
