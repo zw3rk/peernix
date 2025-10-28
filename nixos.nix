@@ -86,6 +86,7 @@ in
       group = cfg.group;
       home = cfg.dataDir;
       createHome = true;
+      homeMode = "0755";
       isSystemUser = true;
     };
 
