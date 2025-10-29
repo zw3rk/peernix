@@ -153,8 +153,8 @@ in
     
     # Add to nix configuration automatically
     nix.settings = {
-      extra-substituters = [ "http://localhost:${toString cfg.settings."http-port"}/nix-cache/" ];
-      extra-trusted-substituters = [ "http://localhost:${toString cfg.settings."http-port"}/nix-cache/" ];
+      # extra-substituters = [ "http://localhost:${toString cfg.settings."http-port"}/nix-cache/" ];
+      # extra-trusted-substituters = [ "http://localhost:${toString cfg.settings."http-port"}/nix-cache/" ];
     };
   };
 }
