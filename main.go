@@ -1291,9 +1291,9 @@ func queryPeersParallel(hash string) *net.UDPAddr {
 	defer cancel()
 
 type result struct {
-		notFound bool // indicates peer responded with "not_found"
 		addr     *net.UDPAddr
 		err      error
+		notFound bool // indicates peer responded with "not_found"
 	}
 
 	results := make(chan result, len(currentPeers))
@@ -1303,7 +1303,7 @@ type result struct {
 		go func(p Peer) {
 			defer func() {
 				if r := recover(); r != nil {
-					results <- result{false, nil, fmt.Errorf("panic in peer query: %v", r)}
+					results <- result{nil, fmt.Errorf("panic in peer query: %v", r), false}
 				}
 			}()
 
@@ -1314,7 +1314,7 @@ type result struct {
 				// Check context before each retry
 				select {
 				case <-ctx.Done():
-					results <- result{false, nil, ctx.Err()}
+					results <- result{nil, ctx.Err(), false}
 					return
 				default:
 				}
@@ -1323,7 +1323,7 @@ type result struct {
 				if attempt > 0 {
 					select {
 					case <-ctx.Done():
-						results <- result{false, nil, ctx.Err()}
+						results <- result{nil, ctx.Err(), false}
 						return
 					case <-time.After(retryDelays[attempt]):
 						// Continue with retry
@@ -1342,7 +1342,7 @@ type result struct {
 							}
 						}
 						peersMux.Unlock()
-						results <- result{false, nil, err}
+						results <- result{nil, err, false}
 						return
 					}
 					continue
@@ -1360,7 +1360,7 @@ type result struct {
 							}
 						}
 						peersMux.Unlock()
-						results <- result{false, nil, err}
+						results <- result{nil, err, false}
 						return
 					}
 					continue
@@ -1381,7 +1381,7 @@ type result struct {
 							}
 						}
 						peersMux.Unlock()
-						results <- result{false, nil, err}
+						results <- result{nil, err, false}
 						return
 					}
 					continue
@@ -1402,7 +1402,7 @@ type result struct {
 							}
 						}
 						peersMux.Unlock()
-						results <- result{false, nil, err}
+						results <- result{nil, err, false}
 						return
 					}
 					continue
@@ -1422,7 +1422,7 @@ type result struct {
 					}
 					peersMux.Unlock()
 
-					results <- result{false, addr, nil}
+					results <- result{addr, nil, false}
 					return
 				} else if response == "not_found" {
 					// Peer responded that it doesn't have the path
@@ -1437,7 +1437,7 @@ type result struct {
 					peersMux.Unlock()
 
 					log.Printf("[DEBUG] Peer %s confirmed not having hash %s", p.Addr, hash)
-					results <- result{true, nil, fmt.Errorf("peer doesn't have path")}
+					results <- result{nil, fmt.Errorf("peer doesn't have path"), true}
 					return
 				} else if attempt == len(retryDelays)-1 {
 					// Unknown response, but peer is healthy
@@ -1451,7 +1451,7 @@ type result struct {
 					}
 					peersMux.Unlock()
 
-					results <- result{false, nil, fmt.Errorf("peer doesn't have path")}
+					results <- result{nil, fmt.Errorf("peer doesn't have path"), false}
 					return
 				}
 				// Path not found, but try again in case of transient issues

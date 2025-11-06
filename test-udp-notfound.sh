@@ -39,8 +39,8 @@ FAKE_HASH="zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
 echo "Querying for hash: $FAKE_HASH"
 cd /home/runner/work/peernix/peernix/test
 
-# Run the UDP test tool
-timeout 5 ./test-udp-direct has_path "$FAKE_HASH" 2>&1 || true
+# Run the UDP test tool (test-udp-direct expects: <peer_ip> <hash>)
+timeout 5 ./test-udp-direct "127.0.0.1" "$FAKE_HASH" 2>&1 || true
 
 echo ""
 echo "📋 Checking peernix logs:"

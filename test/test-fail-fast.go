@@ -10,6 +10,8 @@ import (
 
 // This test simulates peers responding with "not_found" to verify fail-fast behavior
 
+const testHash = "test-hash-for-fail-fast-verification"
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: go run test-fail-fast.go <num_peers>")
@@ -66,8 +68,8 @@ func startMockPeer(id int) {
 		msg := string(buf[:n])
 		fmt.Printf("Peer %d: Received '%s' from %s\n", id, msg, addr)
 
-		// Respond with "not_found" for has_path queries
-		if msg == "has_path?test-hash" {
+		// Respond with "not_found" for has_path queries with our test hash
+		if msg == "has_path?"+testHash {
 			fmt.Printf("Peer %d: Responding with 'not_found'\n", id)
 			conn.WriteToUDP([]byte("not_found"), addr)
 		} else if msg == "ping" {
