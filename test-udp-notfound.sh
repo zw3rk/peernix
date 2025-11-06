@@ -9,7 +9,7 @@ echo "===================================="
 # Build the test UDP tool
 echo "📦 Building test UDP tool..."
 cd /home/runner/work/peernix/peernix/test
-go build -o test-udp test-udp.go
+go build -o test-udp-direct test-udp-direct.go
 
 # Build peernix
 echo "📦 Building peernix..."
@@ -40,7 +40,7 @@ echo "Querying for hash: $FAKE_HASH"
 cd /home/runner/work/peernix/peernix/test
 
 # Run the UDP test tool
-timeout 5 ./test-udp has_path "$FAKE_HASH" 2>&1 || true
+timeout 5 ./test-udp-direct has_path "$FAKE_HASH" 2>&1 || true
 
 echo ""
 echo "📋 Checking peernix logs:"

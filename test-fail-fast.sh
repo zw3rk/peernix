@@ -51,8 +51,6 @@ PEER1_PID=$!
 
 # Start peer 2
 echo "🚀 Starting peer 2 on port 9992..."
-cp peernix2.conf peernix.conf
-cd "$TEMP_DIR/peer2"
 mkdir -p "$TEMP_DIR/peer2"
 cd "$TEMP_DIR/peer2"
 cp "$TEMP_DIR/peernix2.conf" peernix.conf
