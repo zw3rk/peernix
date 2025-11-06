@@ -9,6 +9,9 @@ result-*
 
 # Go build artifacts
 peernix
+test/test-fail-fast
+test/test-udp
+test/test-udp-direct
 
 # macOS
 .DS_Store

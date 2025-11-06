@@ -781,6 +781,10 @@ func udpServer() {
 					metrics.UDPQueriesFound.Add(1)
 					log.Printf("[INFO] Responding YES to %s for hash: %s", addr, hash)
 					conn.WriteToUDP([]byte("yes"), addr)
+				} else {
+					// Respond with not_found to enable fail-fast behavior
+					log.Printf("[DEBUG] Responding NOT_FOUND to %s for hash: %s", addr, hash)
+					conn.WriteToUDP([]byte("not_found"), addr)
 				}
 			} else if msg == "ping" {
 				// Backward compatibility: simple ping/pong
@@ -1287,8 +1291,9 @@ func queryPeersParallel(hash string) *net.UDPAddr {
 	defer cancel()
 
 type result struct {
-		addr *net.UDPAddr
-		err  error
+		addr     *net.UDPAddr
+		err      error
+		notFound bool // indicates peer responded with "not_found"
 	}
 
 	results := make(chan result, len(currentPeers))
@@ -1298,7 +1303,7 @@ type result struct {
 		go func(p Peer) {
 			defer func() {
 				if r := recover(); r != nil {
-					results <- result{nil, fmt.Errorf("panic in peer query: %v", r)}
+					results <- result{nil, fmt.Errorf("panic in peer query: %v", r), false}
 				}
 			}()
 
@@ -1309,7 +1314,7 @@ type result struct {
 				// Check context before each retry
 				select {
 				case <-ctx.Done():
-					results <- result{nil, ctx.Err()}
+					results <- result{nil, ctx.Err(), false}
 					return
 				default:
 				}
@@ -1318,7 +1323,7 @@ type result struct {
 				if attempt > 0 {
 					select {
 					case <-ctx.Done():
-						results <- result{nil, ctx.Err()}
+						results <- result{nil, ctx.Err(), false}
 						return
 					case <-time.After(retryDelays[attempt]):
 						// Continue with retry
@@ -1337,7 +1342,7 @@ type result struct {
 							}
 						}
 						peersMux.Unlock()
-						results <- result{nil, err}
+						results <- result{nil, err, false}
 						return
 					}
 					continue
@@ -1355,7 +1360,7 @@ type result struct {
 							}
 						}
 						peersMux.Unlock()
-						results <- result{nil, err}
+						results <- result{nil, err, false}
 						return
 					}
 					continue
@@ -1376,7 +1381,7 @@ type result struct {
 							}
 						}
 						peersMux.Unlock()
-						results <- result{nil, err}
+						results <- result{nil, err, false}
 						return
 					}
 					continue
@@ -1397,13 +1402,14 @@ type result struct {
 							}
 						}
 						peersMux.Unlock()
-						results <- result{nil, err}
+						results <- result{nil, err, false}
 						return
 					}
 					continue
 				}
 
-				if string(buf[:n]) == "yes" {
+				response := string(buf[:n])
+				if response == "yes" {
 					metrics.PeerQueriesSuccessful.Add(1)
 					// Update peer health on successful response
 					peersMux.Lock()
@@ -1416,10 +1422,10 @@ type result struct {
 					}
 					peersMux.Unlock()
 
-					results <- result{addr, nil}
+					results <- result{addr, nil, false}
 					return
-				} else if attempt == len(retryDelays)-1 {
-					// Path not found, but peer is healthy
+				} else if response == "not_found" {
+					// Peer responded that it doesn't have the path
 					peersMux.Lock()
 					for i := range peers {
 						if peers[i].Addr == p.Addr {
@@ -1430,7 +1436,22 @@ type result struct {
 					}
 					peersMux.Unlock()
 
-					results <- result{nil, fmt.Errorf("peer doesn't have path")}
+					log.Printf("[DEBUG] Peer %s confirmed not having hash %s", p.Addr, hash)
+					results <- result{nil, fmt.Errorf("peer doesn't have path"), true}
+					return
+				} else if attempt == len(retryDelays)-1 {
+					// Unknown response, but peer is healthy
+					peersMux.Lock()
+					for i := range peers {
+						if peers[i].Addr == p.Addr {
+							peers[i].LastSeen = time.Now()
+							peers[i].FailureCount = 0
+							break
+						}
+					}
+					peersMux.Unlock()
+
+					results <- result{nil, fmt.Errorf("peer doesn't have path"), false}
 					return
 				}
 				// Path not found, but try again in case of transient issues
@@ -1439,6 +1460,8 @@ type result struct {
 	}
 
 	// Wait for first success or all failures
+	notFoundCount := 0
+	failureCount := 0
 	for i := 0; i < len(currentPeers); i++ {
 		select {
 		case res := <-results:
@@ -1446,8 +1469,21 @@ type result struct {
 				log.Printf("[INFO] Found %s at peer %s via parallel query", hash, res.addr.IP.String())
 				return res.addr
 			}
+			// Track not_found responses separately from other failures
+			if res.notFound {
+				notFoundCount++
+			} else {
+				failureCount++
+			}
+			// Fail fast if all peers have responded (either not_found or error)
+			if notFoundCount+failureCount == len(currentPeers) {
+				log.Printf("[INFO] All %d peers responded: %d confirmed not found, %d failed/timeout - failing fast", 
+					len(currentPeers), notFoundCount, failureCount)
+				return nil
+			}
 		case <-ctx.Done():
-			log.Printf("[DEBUG] Peer query timeout for hash %s", hash)
+			log.Printf("[DEBUG] Peer query timeout for hash %s after receiving %d responses (%d not_found, %d failed)", 
+				hash, notFoundCount+failureCount, notFoundCount, failureCount)
 			return nil
 		}
 	}
