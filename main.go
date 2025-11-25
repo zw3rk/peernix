@@ -1931,17 +1931,19 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	var hash string
 	var requestedNarHash string // NarHash extracted from URL for .nar requests
 	isNarInfo := strings.HasSuffix(path, ".narinfo")
-	isNar := strings.HasSuffix(path, ".nar")
+	isNar := strings.HasSuffix(path, ".nar") || strings.HasSuffix(path, ".nar.gz")
 
 	if isNarInfo {
 		hash = strings.TrimSuffix(path, ".narinfo")
 	} else if isNar {
-		// New URL format: hash-narhash.nar (e.g., 7cs5xzrnw5p6mdmr7ym2qhg320xn66fi-0xai98y66m98ayc7cl14f50ihm2n10k0nc01r4cgx1i3iyaci105.nar)
-		baseName := strings.TrimSuffix(path, ".nar")
-		// Handle .nar.gz compression suffix
+		// New URL format: hash-narhash.nar or hash-narhash.nar.gz
+		// (e.g., 7cs5xzrnw5p6mdmr7ym2qhg320xn66fi-0xai98y66m98ayc7cl14f50ihm2n10k0nc01r4cgx1i3iyaci105.nar)
+		// Trim .gz first (if present), then .nar to properly handle .nar.gz suffix
+		baseName := path
 		if strings.HasSuffix(baseName, ".gz") {
 			baseName = strings.TrimSuffix(baseName, ".gz")
 		}
+		baseName = strings.TrimSuffix(baseName, ".nar")
 		// Split on first "-" after the store hash (storeHashLength characters)
 		if len(baseName) > storeHashLength && baseName[storeHashLength] == '-' {
 			hash = baseName[:storeHashLength]
