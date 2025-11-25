@@ -55,6 +55,11 @@ var config = Config{
 	RequestTimeout:    5 * time.Minute, // Allow 5 minutes for large file transfers
 }
 
+// storeHashLength is the length of Nix store hash in base32 encoding.
+// This is a fundamental constant in Nix: 160-bit hash truncated to 160 bits,
+// encoded in base32 (32 characters = 160 bits / 5 bits per character).
+const storeHashLength = 32
+
 type Peer struct {
 	Addr         string
 	TTL          time.Time
@@ -1850,8 +1855,8 @@ func queryPeersParallelWithNarHash(hash string, expectedNarHash string) *net.UDP
 
 				results <- result{addr, nil, false}
 				return
-			} else if response == "not_found" || response == "narhash_mismatch" {
-				// Peer doesn't have it or has different content
+			} else if response == "not_found" {
+				// Peer doesn't have the path at all
 				peersMux.Lock()
 				for i := range peers {
 					if peers[i].Addr == p.Addr {
@@ -1862,8 +1867,23 @@ func queryPeersParallelWithNarHash(hash string, expectedNarHash string) *net.UDP
 				}
 				peersMux.Unlock()
 
-				log.Printf("[DEBUG] Peer %s responded %s for hash %s with NarHash %s", p.Addr, response, hash, expectedNarHash)
-				results <- result{nil, fmt.Errorf("peer responded: %s", response), true}
+				log.Printf("[DEBUG] Peer %s does not have hash %s", p.Addr, hash)
+				results <- result{nil, fmt.Errorf("peer does not have path"), true}
+				return
+			} else if response == "narhash_mismatch" {
+				// Peer has the path but with different content (different NarHash)
+				peersMux.Lock()
+				for i := range peers {
+					if peers[i].Addr == p.Addr {
+						peers[i].LastSeen = time.Now()
+						peers[i].FailureCount = 0
+						break
+					}
+				}
+				peersMux.Unlock()
+
+				log.Printf("[DEBUG] Peer %s has hash %s but NarHash mismatch (requested: %s)", p.Addr, hash, expectedNarHash)
+				results <- result{nil, fmt.Errorf("peer has different content"), true}
 				return
 			}
 
@@ -1922,11 +1942,10 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(baseName, ".gz") {
 			baseName = strings.TrimSuffix(baseName, ".gz")
 		}
-		// Split on first "-" after the 32-character store hash
-		// Store hash is always 32 characters
-		if len(baseName) > 32 && baseName[32] == '-' {
-			hash = baseName[:32]
-			requestedNarHash = baseName[33:]
+		// Split on first "-" after the store hash (storeHashLength characters)
+		if len(baseName) > storeHashLength && baseName[storeHashLength] == '-' {
+			hash = baseName[:storeHashLength]
+			requestedNarHash = baseName[storeHashLength+1:]
 			log.Printf("[DEBUG] Parsed NAR URL: hash=%s, narHash=%s", hash, requestedNarHash)
 		} else {
 			// Legacy format without NarHash - just use the whole thing as hash
@@ -1956,7 +1975,11 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	if isNar && requestedNarHash != "" {
 		localHasPath = hasPathWithNarHash(hash, requestedNarHash)
 		if hasPath(hash) && !localHasPath {
-			log.Printf("[WARN] Local store has hash %s but NarHash mismatch (requested: %s)", hash, requestedNarHash)
+			if localNarHash, ok := getNarHash(hash); ok {
+				log.Printf("[WARN] Local store has hash %s but NarHash mismatch (requested: %s, local: %s)", hash, requestedNarHash, narHashToURLSafe(localNarHash))
+			} else {
+				log.Printf("[WARN] Local store has hash %s but NarHash mismatch (requested: %s, local: unknown)", hash, requestedNarHash)
+			}
 		}
 	} else {
 		localHasPath = hasPath(hash)
