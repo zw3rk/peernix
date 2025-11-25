@@ -55,6 +55,11 @@ var config = Config{
 	RequestTimeout:    5 * time.Minute, // Allow 5 minutes for large file transfers
 }
 
+// storeHashLength is the length of Nix store hash in base32 encoding.
+// This is a fundamental constant in Nix: 160-bit hash truncated to 160 bits,
+// encoded in base32 (32 characters = 160 bits / 5 bits per character).
+const storeHashLength = 32
+
 type Peer struct {
 	Addr         string
 	TTL          time.Time
@@ -773,7 +778,33 @@ func udpServer() {
 
 		// Handle each message concurrently to prevent blocking
 		go func(msg string, addr *net.UDPAddr) {
-			if strings.HasPrefix(msg, "has_path?") {
+			if strings.HasPrefix(msg, "has_path_with_narhash?") {
+				// New protocol: has_path_with_narhash?hash:narhash
+				// This enables stateless NarHash verification
+				payload := strings.TrimPrefix(msg, "has_path_with_narhash?")
+				parts := strings.SplitN(payload, ":", 2)
+				if len(parts) != 2 {
+					log.Printf("[WARN] Invalid has_path_with_narhash format from %s: %s", addr, msg)
+					conn.WriteToUDP([]byte("invalid_format"), addr)
+					return
+				}
+				hash := parts[0]
+				expectedNarHash := parts[1]
+				metrics.UDPQueriesReceived.Add(1)
+				
+				if hasPathWithNarHash(hash, expectedNarHash) {
+					metrics.UDPQueriesFound.Add(1)
+					log.Printf("[INFO] Responding YES to %s for hash: %s with NarHash: %s", addr, hash, expectedNarHash)
+					conn.WriteToUDP([]byte("yes"), addr)
+				} else if hasPath(hash) {
+					// We have the path but NarHash doesn't match
+					log.Printf("[DEBUG] Responding NARHASH_MISMATCH to %s for hash: %s (requested NarHash: %s)", addr, hash, expectedNarHash)
+					conn.WriteToUDP([]byte("narhash_mismatch"), addr)
+				} else {
+					log.Printf("[DEBUG] Responding NOT_FOUND to %s for hash: %s", addr, hash)
+					conn.WriteToUDP([]byte("not_found"), addr)
+				}
+			} else if strings.HasPrefix(msg, "has_path?") {
 				hash := strings.TrimPrefix(msg, "has_path?")
 				metrics.UDPQueriesReceived.Add(1)
 				// Reduced logging verbosity - only log successful responses to reduce noise
@@ -1156,6 +1187,75 @@ func hasPath(hash string) bool {
 	return true
 }
 
+// getNarHash returns the NarHash for a store path (with caching)
+func getNarHash(hash string) (string, bool) {
+	cacheKey := "narhash:" + hash
+
+	// Check cache first
+	storeCacheMux.RLock()
+	if cached, exists := storeCache[cacheKey]; exists {
+		if time.Since(cached.timestamp) < 5*time.Minute {
+			storeCacheMux.RUnlock()
+			if cached.err != nil {
+				return "", false
+			}
+			return cached.result.(string), true
+		}
+	}
+	storeCacheMux.RUnlock()
+
+	// Get full path first
+	fullPath, found := findStorePath(hash)
+	if !found {
+		return "", false
+	}
+
+	// Get NAR hash from nix-store
+	cmd := exec.Command("nix-store", "--query", "--hash", fullPath)
+	out, err := cmd.Output()
+
+	// Cache the result
+	storeCacheMux.Lock()
+	if err != nil {
+		storeCache[cacheKey] = storeResult{"", time.Now(), err}
+	} else {
+		narHash := strings.TrimSpace(string(out))
+		storeCache[cacheKey] = storeResult{narHash, time.Now(), nil}
+	}
+	storeCacheMux.Unlock()
+
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(out)), true
+}
+
+// narHashToURLSafe converts a NarHash (e.g., "sha256:1abc...") to URL-safe format
+// by removing the hash type prefix
+func narHashToURLSafe(narHash string) string {
+	// NarHash format is typically "sha256:base32hash"
+	// We want just the base32 hash part for the URL
+	if idx := strings.Index(narHash, ":"); idx != -1 {
+		return narHash[idx+1:]
+	}
+	return narHash
+}
+
+// hasPathWithNarHash checks if we have a path and its NarHash matches the expected value
+func hasPathWithNarHash(hash string, expectedNarHash string) bool {
+	if !hasPath(hash) {
+		return false
+	}
+
+	narHash, found := getNarHash(hash)
+	if !found {
+		return false
+	}
+
+	// Compare the URL-safe version of the NarHash
+	return narHashToURLSafe(narHash) == expectedNarHash
+}
+
 func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	fullPath, found := findStorePath(hash)
 	if !found {
@@ -1198,7 +1298,8 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	if err != nil {
 		return err
 	}
-	url := hash + ".nar"
+	// Include NarHash in URL for stateless verification: hash-narhash.nar
+	url := hash + "-" + narHashToURLSafe(narHash) + ".nar"
 	compression := "none"
 	if compress {
 		url += ".gz"
@@ -1613,6 +1714,212 @@ func findPeerForHash(hash string) *net.UDPAddr {
 	return peerAddr
 }
 
+// findPeerForHashWithNarHash finds a peer that has both the hash and matching NarHash
+// This enables stateless .nar requests by verifying content integrity via NarHash
+func findPeerForHashWithNarHash(hash string, narHash string) *net.UDPAddr {
+	cacheKey := hash + "-" + narHash
+	requestsMux.Lock()
+	if pendingCh, exists := pendingRequests[cacheKey]; exists {
+		// Another request is already in progress, wait for its result
+		requestsMux.Unlock()
+		log.Printf("[DEBUG] Joining existing request for hash %s with NarHash %s", hash, narHash)
+
+		select {
+		case peerAddr := <-pendingCh:
+			if peerAddr == nil {
+				log.Printf("[INFO] Deduplicated request failed for hash %s with NarHash %s", hash, narHash)
+				return nil
+			}
+			log.Printf("[INFO] Using result from deduplicated request for hash %s with NarHash %s", hash, narHash)
+			return peerAddr
+		case <-time.After(5 * time.Second):
+			log.Printf("[WARN] Timeout waiting for deduplicated request for hash %s with NarHash %s", hash, narHash)
+			return nil
+		}
+	}
+
+	// Create new pending request channel
+	pendingCh := make(chan *net.UDPAddr, 10)
+
+	pendingRequests[cacheKey] = pendingCh
+	requestsMux.Unlock()
+
+	// Query peers in parallel with NarHash verification
+	log.Printf("[INFO] Querying peers for hash %s with NarHash %s", hash, narHash)
+	peerAddr := queryPeersParallelWithNarHash(hash, narHash)
+
+	// Notify all waiting requests of the result
+	requestsMux.Lock()
+	delete(pendingRequests, cacheKey)
+	requestsMux.Unlock()
+
+	// Send result to all waiters
+	go func() {
+		defer close(pendingCh)
+		for i := 0; i < cap(pendingCh); i++ {
+			select {
+			case pendingCh <- peerAddr:
+			default:
+				return
+			}
+		}
+	}()
+
+	return peerAddr
+}
+
+// queryPeersParallelWithNarHash queries all known peers for a hash with NarHash verification
+func queryPeersParallelWithNarHash(hash string, expectedNarHash string) *net.UDPAddr {
+	peersMux.RLock()
+	if len(peers) == 0 {
+		peersMux.RUnlock()
+		return nil
+	}
+
+	// Create a copy of peers to avoid holding lock during network operations
+	currentPeers := make([]Peer, len(peers))
+	copy(currentPeers, peers)
+	peersMux.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	type result struct {
+		addr     *net.UDPAddr
+		err      error
+		notFound bool
+	}
+
+	results := make(chan result, len(currentPeers))
+
+	// Query each peer concurrently - use new protocol: has_path_with_narhash?hash:narhash
+	for _, peer := range currentPeers {
+		go func(p Peer) {
+			defer func() {
+				if r := recover(); r != nil {
+					results <- result{nil, fmt.Errorf("panic in peer query: %v", r), false}
+				}
+			}()
+
+			// Single attempt for NarHash verification (no retry needed for verification)
+			select {
+			case <-ctx.Done():
+				results <- result{nil, ctx.Err(), false}
+				return
+			default:
+			}
+
+			addr, err := net.ResolveUDPAddr("udp", p.Addr+":"+config.UDPPort)
+			if err != nil {
+				results <- result{nil, err, false}
+				return
+			}
+
+			conn, err := net.DialUDP("udp", nil, addr)
+			if err != nil {
+				results <- result{nil, err, false}
+				return
+			}
+			defer conn.Close()
+
+			conn.SetDeadline(time.Now().Add(1 * time.Second))
+			metrics.PeerQueriesAttempted.Add(1)
+			
+			// New protocol: has_path_with_narhash?hash:narhash
+			_, err = conn.Write([]byte("has_path_with_narhash?" + hash + ":" + expectedNarHash))
+			if err != nil {
+				results <- result{nil, err, false}
+				return
+			}
+
+			buf := make([]byte, 1024)
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				results <- result{nil, err, false}
+				return
+			}
+
+			response := string(buf[:n])
+			if response == "yes" {
+				metrics.PeerQueriesSuccessful.Add(1)
+				// Update peer health on successful response
+				peersMux.Lock()
+				for i := range peers {
+					if peers[i].Addr == p.Addr {
+						peers[i].LastSeen = time.Now()
+						peers[i].FailureCount = 0
+						break
+					}
+				}
+				peersMux.Unlock()
+
+				results <- result{addr, nil, false}
+				return
+			} else if response == "not_found" {
+				// Peer doesn't have the path at all
+				peersMux.Lock()
+				for i := range peers {
+					if peers[i].Addr == p.Addr {
+						peers[i].LastSeen = time.Now()
+						peers[i].FailureCount = 0
+						break
+					}
+				}
+				peersMux.Unlock()
+
+				log.Printf("[DEBUG] Peer %s does not have hash %s", p.Addr, hash)
+				results <- result{nil, fmt.Errorf("peer does not have path"), true}
+				return
+			} else if response == "narhash_mismatch" {
+				// Peer has the path but with different content (different NarHash)
+				peersMux.Lock()
+				for i := range peers {
+					if peers[i].Addr == p.Addr {
+						peers[i].LastSeen = time.Now()
+						peers[i].FailureCount = 0
+						break
+					}
+				}
+				peersMux.Unlock()
+
+				log.Printf("[DEBUG] Peer %s has hash %s but NarHash mismatch (requested: %s)", p.Addr, hash, expectedNarHash)
+				results <- result{nil, fmt.Errorf("peer has different content"), true}
+				return
+			}
+
+			results <- result{nil, fmt.Errorf("unexpected response: %s", response), false}
+		}(peer)
+	}
+
+	// Wait for first success or all failures
+	notFoundCount := 0
+	failureCount := 0
+	for i := 0; i < len(currentPeers); i++ {
+		select {
+		case res := <-results:
+			if res.err == nil {
+				log.Printf("[INFO] Found %s with NarHash %s at peer %s", hash, expectedNarHash, res.addr.IP.String())
+				return res.addr
+			}
+			if res.notFound {
+				notFoundCount++
+			} else {
+				failureCount++
+			}
+			if notFoundCount+failureCount == len(currentPeers) {
+				log.Printf("[INFO] All %d peers responded: %d not found/mismatch, %d failed - failing fast",
+					len(currentPeers), notFoundCount, failureCount)
+				return nil
+			}
+		case <-ctx.Done():
+			log.Printf("[DEBUG] Peer query timeout for hash %s with NarHash %s", hash, expectedNarHash)
+			return nil
+		}
+	}
+
+	return nil
+}
+
 func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	path := strings.TrimPrefix(r.URL.Path, "/nix-cache/")
@@ -1622,13 +1929,31 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	cw := &countingWriter{ResponseWriter: w}
 
 	var hash string
+	var requestedNarHash string // NarHash extracted from URL for .nar requests
 	isNarInfo := strings.HasSuffix(path, ".narinfo")
-	isNar := strings.HasSuffix(path, ".nar")
+	isNar := strings.HasSuffix(path, ".nar") || strings.HasSuffix(path, ".nar.gz")
 
 	if isNarInfo {
 		hash = strings.TrimSuffix(path, ".narinfo")
 	} else if isNar {
-		hash = strings.TrimSuffix(path, ".nar")
+		// New URL format: hash-narhash.nar or hash-narhash.nar.gz
+		// (e.g., 7cs5xzrnw5p6mdmr7ym2qhg320xn66fi-0xai98y66m98ayc7cl14f50ihm2n10k0nc01r4cgx1i3iyaci105.nar)
+		// Trim .gz first (if present), then .nar to properly handle .nar.gz suffix
+		baseName := path
+		if strings.HasSuffix(baseName, ".gz") {
+			baseName = strings.TrimSuffix(baseName, ".gz")
+		}
+		baseName = strings.TrimSuffix(baseName, ".nar")
+		// Split on first "-" after the store hash (storeHashLength characters)
+		if len(baseName) > storeHashLength && baseName[storeHashLength] == '-' {
+			hash = baseName[:storeHashLength]
+			requestedNarHash = baseName[storeHashLength+1:]
+			log.Printf("[DEBUG] Parsed NAR URL: hash=%s, narHash=%s", hash, requestedNarHash)
+		} else {
+			// Legacy format without NarHash - just use the whole thing as hash
+			hash = baseName
+			log.Printf("[DEBUG] Legacy NAR URL format: hash=%s", hash)
+		}
 	} else {
 		log.Printf("[DEBUG] Invalid path format: %s", path)
 		http.Error(w, "Not found", 404)
@@ -1647,7 +1972,22 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	compress := config.CompressionEnabled && supportsCompression(r.Header.Get("Accept-Encoding")) && isNar
 
 	// Check local store first
-	if hasPath(hash) {
+	// For .nar requests with NarHash, verify the hash matches
+	localHasPath := false
+	if isNar && requestedNarHash != "" {
+		localHasPath = hasPathWithNarHash(hash, requestedNarHash)
+		if hasPath(hash) && !localHasPath {
+			if localNarHash, ok := getNarHash(hash); ok {
+				log.Printf("[WARN] Local store has hash %s but NarHash mismatch (requested: %s, local: %s)", hash, requestedNarHash, narHashToURLSafe(localNarHash))
+			} else {
+				log.Printf("[WARN] Local store has hash %s but NarHash mismatch (requested: %s, local: unknown)", hash, requestedNarHash)
+			}
+		}
+	} else {
+		localHasPath = hasPath(hash)
+	}
+
+	if localHasPath {
 		metrics.Hits.Add(1)
 		log.Printf("[INFO] Serving %s from local store", path)
 		if isNarInfo {
@@ -1658,12 +1998,6 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 			} else {
 				metrics.FilesSent.Add(1)
 				metrics.BytesSent.Add(uint64(cw.bytes))
-				
-				// Cache "localhost" marker so .nar requests know this was served locally
-				// This allows fallback to peers if path is deleted later (e.g., by GC)
-				narInfoPeerCacheMux.Lock()
-				narInfoPeerCache[hash] = "localhost"
-				narInfoPeerCacheMux.Unlock()
 			}
 		} else {
 			cw.Header().Set("Content-Type", "application/x-nix-nar")
@@ -1687,17 +2021,27 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 
 	// If not in local store, find a peer
 	var peerIP string
-	var exists bool
 
-	// For .nar requests, check the cache for a sticky peer first
-	if isNar {
+	// For .nar requests with embedded NarHash, we can query peers directly (stateless)
+	// For .narinfo requests, we need to query peers for the hash
+	if isNar && requestedNarHash != "" {
+		// Stateless: use embedded NarHash to find peer
+		peerAddr := findPeerForHashWithNarHash(hash, requestedNarHash)
+		if peerAddr == nil {
+			metrics.Misses.Add(1)
+			log.Printf("[INFO] No peers found for %s with NarHash %s", hash, requestedNarHash)
+			http.Error(cw, "Not found in local store or peers", 404)
+			return
+		}
+		peerIP = peerAddr.IP.String()
+		log.Printf("[INFO] Found peer %s for .nar request of hash %s (stateless via NarHash)", peerIP, hash)
+	} else if isNar {
+		// Legacy .nar request without NarHash - check cache
 		narInfoPeerCacheMux.RLock()
-		peerIP, exists = narInfoPeerCache[hash]
+		cachedPeerIP, exists := narInfoPeerCache[hash]
 		narInfoPeerCacheMux.RUnlock()
 		if exists {
-			// If cached peer is "localhost" but we're here, path was deleted (likely by GC)
-			// Fall back to querying peers
-			if peerIP == "localhost" {
+			if cachedPeerIP == "localhost" {
 				log.Printf("[INFO] Path was served locally but no longer in store, querying peers for hash %s", hash)
 				peerAddr := findPeerForHash(hash)
 				if peerAddr == nil {
@@ -1707,24 +2051,20 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				peerIP = peerAddr.IP.String()
-				// Update cache with actual peer
 				narInfoPeerCacheMux.Lock()
 				narInfoPeerCache[hash] = peerIP
 				narInfoPeerCacheMux.Unlock()
-				log.Printf("[INFO] Found peer %s for .nar request of hash %s (fallback after local deletion)", peerIP, hash)
 			} else {
-				log.Printf("[INFO] Found cached peer %s for .nar request of hash %s", peerIP, hash)
+				peerIP = cachedPeerIP
+				log.Printf("[INFO] Found cached peer %s for legacy .nar request of hash %s", peerIP, hash)
 			}
 		} else {
-			log.Printf("[WARN] No cached peer for .nar hash %s. Refusing to query network to avoid hash mismatch.", hash)
+			log.Printf("[WARN] No cached peer for legacy .nar hash %s. Refusing to query network.", hash)
 			http.Error(cw, "Not found, peer for .nar not cached", 404)
 			return
 		}
-	}
-
-	// If no peer is cached (which is now only possible for .narinfo requests), query the network
-	if isNarInfo {
-		// Use request deduplication to query peers
+	} else {
+		// .narinfo request - query the network
 		peerAddr := findPeerForHash(hash)
 		if peerAddr == nil {
 			metrics.Misses.Add(1)
@@ -1734,7 +2074,7 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 		}
 		peerIP = peerAddr.IP.String()
 
-		// cache the peer that had it
+		// cache the peer that had it (for legacy .nar requests without NarHash)
 		log.Printf("[INFO] Caching peer %s for .narinfo of hash %s", peerIP, hash)
 		narInfoPeerCacheMux.Lock()
 		narInfoPeerCache[hash] = peerIP
