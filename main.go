@@ -96,7 +96,11 @@ type Metrics struct {
 	UDPQueriesFound       atomic.Uint64 // UDP queries we responded "yes" to
 	PeerQueriesAttempted  atomic.Uint64 // Queries we made to peers
 	PeerQueriesSuccessful atomic.Uint64 // Successful peer queries
+	NegativeCacheHits     atomic.Uint64 // Lookups served from negative cache
+	NegativeCacheSize     atomic.Int64  // Current entries in negative cache
 	RequestTimes          []time.Duration
+	NarInfoTimes          []time.Duration // narinfo lookup latency (separate from NAR transfer)
+	NarTransferTimes      []time.Duration // NAR file transfer latency
 	RequestMux            sync.RWMutex
 }
 
@@ -128,6 +132,12 @@ var (
 	// narInfoPeerCache caches which peer served a .narinfo file
 	narInfoPeerCache    = make(map[string]string)
 	narInfoPeerCacheMux sync.RWMutex
+
+	// negativeCache records hashes that no peer has, avoiding repeated
+	// UDP fanouts for paths that will never be found.
+	negativeCache    = make(map[string]time.Time)
+	negativeCacheMux sync.RWMutex
+	negativeCacheTTL = 5 * time.Minute
 )
 
 // storeResult caches nix-store operation results
@@ -562,20 +572,32 @@ func handleNixCacheInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	// Calculate average latency and trim request times
+	// Calculate average latencies and trim history
 	metrics.RequestMux.Lock()
-	var avgLatency time.Duration
+	var avgLatency, avgNarInfoLatency, avgNarTransferLatency time.Duration
 	if len(metrics.RequestTimes) > 0 {
 		var total time.Duration
 		for _, t := range metrics.RequestTimes {
 			total += t
 		}
 		avgLatency = total / time.Duration(len(metrics.RequestTimes))
-
-		// Keep only last 1000 request times (now safe under write lock)
 		if len(metrics.RequestTimes) > 1000 {
 			metrics.RequestTimes = metrics.RequestTimes[len(metrics.RequestTimes)-1000:]
 		}
+	}
+	if len(metrics.NarInfoTimes) > 0 {
+		var total time.Duration
+		for _, t := range metrics.NarInfoTimes {
+			total += t
+		}
+		avgNarInfoLatency = total / time.Duration(len(metrics.NarInfoTimes))
+	}
+	if len(metrics.NarTransferTimes) > 0 {
+		var total time.Duration
+		for _, t := range metrics.NarTransferTimes {
+			total += t
+		}
+		avgNarTransferLatency = total / time.Duration(len(metrics.NarTransferTimes))
 	}
 	metrics.RequestMux.Unlock()
 
@@ -630,9 +652,28 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE peernix_peers_current gauge\n")
 	fmt.Fprintf(w, "peernix_peers_current %d\n", peerCount)
 
-	fmt.Fprintf(w, "# HELP peernix_request_latency_ms Average request latency in milliseconds\n")
+	fmt.Fprintf(w, "# HELP peernix_request_latency_ms Average request latency in milliseconds (all requests)\n")
 	fmt.Fprintf(w, "# TYPE peernix_request_latency_ms gauge\n")
 	fmt.Fprintf(w, "peernix_request_latency_ms %d\n", avgLatency.Milliseconds())
+
+	fmt.Fprintf(w, "# HELP peernix_narinfo_latency_ms Average narinfo lookup latency in milliseconds\n")
+	fmt.Fprintf(w, "# TYPE peernix_narinfo_latency_ms gauge\n")
+	fmt.Fprintf(w, "peernix_narinfo_latency_ms %d\n", avgNarInfoLatency.Milliseconds())
+
+	fmt.Fprintf(w, "# HELP peernix_nar_transfer_latency_ms Average NAR transfer latency in milliseconds\n")
+	fmt.Fprintf(w, "# TYPE peernix_nar_transfer_latency_ms gauge\n")
+	fmt.Fprintf(w, "peernix_nar_transfer_latency_ms %d\n", avgNarTransferLatency.Milliseconds())
+
+	fmt.Fprintf(w, "# HELP peernix_negative_cache_hits_total Lookups served from negative cache\n")
+	fmt.Fprintf(w, "# TYPE peernix_negative_cache_hits_total counter\n")
+	fmt.Fprintf(w, "peernix_negative_cache_hits_total %d\n", metrics.NegativeCacheHits.Load())
+
+	negativeCacheMux.RLock()
+	negCacheSize := len(negativeCache)
+	negativeCacheMux.RUnlock()
+	fmt.Fprintf(w, "# HELP peernix_negative_cache_size Current entries in negative cache\n")
+	fmt.Fprintf(w, "# TYPE peernix_negative_cache_size gauge\n")
+	fmt.Fprintf(w, "peernix_negative_cache_size %d\n", negCacheSize)
 }
 
 func handlePublicKey(w http.ResponseWriter, r *http.Request) {
@@ -676,9 +717,9 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Files Received: %d\n", metrics.FilesReceived.Load())
 	fmt.Fprintf(w, "Bytes Received: %d\n", metrics.BytesReceived.Load())
 
-	// Average latency
+	// Average latencies — broken down by request type
 	metrics.RequestMux.RLock()
-	var avgLatency time.Duration
+	var avgLatency, avgNarInfoLatency, avgNarTransferLatency time.Duration
 	if len(metrics.RequestTimes) > 0 {
 		var total time.Duration
 		for _, t := range metrics.RequestTimes {
@@ -686,8 +727,28 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		avgLatency = total / time.Duration(len(metrics.RequestTimes))
 	}
+	if len(metrics.NarInfoTimes) > 0 {
+		var total time.Duration
+		for _, t := range metrics.NarInfoTimes {
+			total += t
+		}
+		avgNarInfoLatency = total / time.Duration(len(metrics.NarInfoTimes))
+	}
+	if len(metrics.NarTransferTimes) > 0 {
+		var total time.Duration
+		for _, t := range metrics.NarTransferTimes {
+			total += t
+		}
+		avgNarTransferLatency = total / time.Duration(len(metrics.NarTransferTimes))
+	}
 	metrics.RequestMux.RUnlock()
-	fmt.Fprintf(w, "Avg Latency: %s\n\n", avgLatency.String())
+	fmt.Fprintf(w, "Avg Latency: %s (overall)\n", avgLatency.String())
+	fmt.Fprintf(w, "Avg NarInfo Lookup: %s\n", avgNarInfoLatency.String())
+	fmt.Fprintf(w, "Avg NAR Transfer: %s\n", avgNarTransferLatency.String())
+	fmt.Fprintf(w, "Negative Cache Hits: %d\n", metrics.NegativeCacheHits.Load())
+	negativeCacheMux.RLock()
+	fmt.Fprintf(w, "Negative Cache Size: %d\n\n", len(negativeCache))
+	negativeCacheMux.RUnlock()
 
 	// Discovered peers
 	peersMux.RLock()
@@ -765,6 +826,20 @@ func udpServer() {
 		for range time.Tick(config.DiscoveryInterval) {
 			log.Printf("[DEBUG] " + "Running periodic peer discovery")
 			updatePeers()
+		}
+	}()
+
+	// Periodic eviction of expired negative-cache entries.
+	go func() {
+		for range time.Tick(1 * time.Minute) {
+			now := time.Now()
+			negativeCacheMux.Lock()
+			for k, expiry := range negativeCache {
+				if now.After(expiry) {
+					delete(negativeCache, k)
+				}
+			}
+			negativeCacheMux.Unlock()
 		}
 	}()
 
@@ -864,6 +939,12 @@ func udpServer() {
 							Features:   discoveryMsg.Features,
 							PublicKey:  discoveryMsg.PublicKey,
 						})
+						// New peer may have paths we previously cached as
+						// missing — flush the negative cache.
+						negativeCacheMux.Lock()
+						negativeCache = make(map[string]time.Time)
+						negativeCacheMux.Unlock()
+						log.Printf("[INFO] Flushed negative cache — new peer %s discovered", addr.IP.String())
 					}
 					peersMux.Unlock()
 
@@ -971,6 +1052,10 @@ func updatePeersUDP() {
 		}
 		if !found {
 			peers = append(peers, newPeer)
+			// Flush negative cache — new peer may have paths we cached as missing.
+			negativeCacheMux.Lock()
+			negativeCache = make(map[string]time.Time)
+			negativeCacheMux.Unlock()
 		}
 	}
 
@@ -1121,7 +1206,11 @@ merge_peers:
 	peersMux.Unlock()
 
 	if oldCount != len(peers) {
-		log.Printf("[INFO] mDNS discovery updated peer count: %d", len(peers))
+		// Flush negative cache — new peers may have paths we cached as missing.
+		negativeCacheMux.Lock()
+		negativeCache = make(map[string]time.Time)
+		negativeCacheMux.Unlock()
+		log.Printf("[INFO] mDNS discovery updated peer count: %d (negative cache flushed)", len(peers))
 	}
 }
 
@@ -1375,31 +1464,46 @@ func generateNarInfo(hash string, w io.Writer, compress bool) error {
 	return nil
 }
 
-// queryPeersParallel queries all known peers in parallel for a hash
+// queryPeersParallel queries all known peers in parallel for a hash.
+//
+// Peers respond "yes" or "not_found" immediately, so the typical
+// round-trip on a LAN is <1ms.  A "not_found" is definitive — no
+// retries.  Only transport errors get a single retry.
+//
+// If all peers say "not_found", a negative-cache entry is created so
+// subsequent lookups return immediately for negativeCacheTTL.
 func queryPeersParallel(hash string) *net.UDPAddr {
+	// Check negative cache first.
+	negativeCacheMux.RLock()
+	if expiry, ok := negativeCache[hash]; ok && time.Now().Before(expiry) {
+		negativeCacheMux.RUnlock()
+		metrics.NegativeCacheHits.Add(1)
+		return nil
+	}
+	negativeCacheMux.RUnlock()
+
 	peersMux.RLock()
 	if len(peers) == 0 {
 		peersMux.RUnlock()
 		return nil
 	}
-
-	// Create a copy of peers to avoid holding lock during network operations
 	currentPeers := make([]Peer, len(peers))
 	copy(currentPeers, peers)
 	peersMux.RUnlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// On a LAN, peers respond in <1ms.  500ms is generous enough to
+	// tolerate a slow peer without penalising every cache miss.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-type result struct {
+	type result struct {
 		addr     *net.UDPAddr
 		err      error
-		notFound bool // indicates peer responded with "not_found"
+		notFound bool
 	}
 
 	results := make(chan result, len(currentPeers))
 
-	// Query each peer concurrently with retry logic
 	for _, peer := range currentPeers {
 		go func(p Peer) {
 			defer func() {
@@ -1408,159 +1512,85 @@ type result struct {
 				}
 			}()
 
-			// Retry logic with exponential backoff: immediate, 100ms, 500ms, 2s
-			retryDelays := []time.Duration{0, 100*time.Millisecond, 500*time.Millisecond, 2*time.Second}
+			addr, err := net.ResolveUDPAddr("udp", p.Addr+":"+config.UDPPort)
+			if err != nil {
+				results <- result{nil, err, false}
+				return
+			}
 
-			for attempt := 0; attempt < len(retryDelays); attempt++ {
-				// Check context before each retry
-				select {
-				case <-ctx.Done():
-					results <- result{nil, ctx.Err(), false}
-					return
-				default:
-				}
+			conn, err := net.DialUDP("udp", nil, addr)
+			if err != nil {
+				results <- result{nil, err, false}
+				return
+			}
+			defer conn.Close()
 
-				// Wait for retry delay (except first attempt)
-				if attempt > 0 {
-					select {
-					case <-ctx.Done():
-						results <- result{nil, ctx.Err(), false}
-						return
-					case <-time.After(retryDelays[attempt]):
-						// Continue with retry
+			// 200ms is plenty for a LAN round-trip.
+			conn.SetDeadline(time.Now().Add(200 * time.Millisecond))
+			metrics.PeerQueriesAttempted.Add(1)
+			_, err = conn.Write([]byte("has_path?" + hash))
+			if err != nil {
+				peersMux.Lock()
+				for i := range peers {
+					if peers[i].Addr == p.Addr {
+						peers[i].FailureCount++
+						break
 					}
 				}
+				peersMux.Unlock()
+				results <- result{nil, err, false}
+				return
+			}
 
-				addr, err := net.ResolveUDPAddr("udp", p.Addr+":"+config.UDPPort)
-				if err != nil {
-					if attempt == len(retryDelays)-1 {
-						// Update failure count on final failure
-						peersMux.Lock()
-						for i := range peers {
-							if peers[i].Addr == p.Addr {
-								peers[i].FailureCount++
-								break
-							}
-						}
-						peersMux.Unlock()
-						results <- result{nil, err, false}
-						return
-					}
-					continue
-				}
-
-				conn, err := net.DialUDP("udp", nil, addr)
-				if err != nil {
-					if attempt == len(retryDelays)-1 {
-						// Update failure count on final failure
-						peersMux.Lock()
-						for i := range peers {
-							if peers[i].Addr == p.Addr {
-								peers[i].FailureCount++
-								break
-							}
-						}
-						peersMux.Unlock()
-						results <- result{nil, err, false}
-						return
-					}
-					continue
-				}
-
-				conn.SetDeadline(time.Now().Add(1 * time.Second))
-				metrics.PeerQueriesAttempted.Add(1)
+			buf := make([]byte, 1024)
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				// Timeout — retry once.
+				conn.SetDeadline(time.Now().Add(200 * time.Millisecond))
 				_, err = conn.Write([]byte("has_path?" + hash))
 				if err != nil {
-					conn.Close()
-					if attempt == len(retryDelays)-1 {
-						// Update failure count on final failure
-						peersMux.Lock()
-						for i := range peers {
-							if peers[i].Addr == p.Addr {
-								peers[i].FailureCount++
-								break
-							}
-						}
-						peersMux.Unlock()
-						results <- result{nil, err, false}
-						return
-					}
-					continue
+					results <- result{nil, err, false}
+					return
 				}
-
-				buf := make([]byte, 1024)
-				n, _, err := conn.ReadFromUDP(buf)
-				conn.Close()
-
+				n, _, err = conn.ReadFromUDP(buf)
 				if err != nil {
-					if attempt == len(retryDelays)-1 {
-						// Update failure count on final failure
-						peersMux.Lock()
-						for i := range peers {
-							if peers[i].Addr == p.Addr {
-								peers[i].FailureCount++
-								break
-							}
-						}
-						peersMux.Unlock()
-						results <- result{nil, err, false}
-						return
-					}
-					continue
-				}
-
-				response := string(buf[:n])
-				if response == "yes" {
-					metrics.PeerQueriesSuccessful.Add(1)
-					// Update peer health on successful response
 					peersMux.Lock()
 					for i := range peers {
 						if peers[i].Addr == p.Addr {
-							peers[i].LastSeen = time.Now()
-							peers[i].FailureCount = 0
+							peers[i].FailureCount++
 							break
 						}
 					}
 					peersMux.Unlock()
-
-					results <- result{addr, nil, false}
-					return
-				} else if response == "not_found" {
-					// Peer responded that it doesn't have the path
-					peersMux.Lock()
-					for i := range peers {
-						if peers[i].Addr == p.Addr {
-							peers[i].LastSeen = time.Now()
-							peers[i].FailureCount = 0
-							break
-						}
-					}
-					peersMux.Unlock()
-
-					log.Printf("[DEBUG] Peer %s confirmed not having hash %s", p.Addr, hash)
-					results <- result{nil, fmt.Errorf("peer doesn't have path"), true}
-					return
-				} else if attempt == len(retryDelays)-1 {
-					// Unknown response, but peer is healthy
-					peersMux.Lock()
-					for i := range peers {
-						if peers[i].Addr == p.Addr {
-							peers[i].LastSeen = time.Now()
-							peers[i].FailureCount = 0
-							break
-						}
-					}
-					peersMux.Unlock()
-
-					results <- result{nil, fmt.Errorf("peer doesn't have path"), false}
+					results <- result{nil, err, false}
 					return
 				}
-				// Path not found, but try again in case of transient issues
+			}
+
+			response := string(buf[:n])
+
+			// Update peer health on any valid response.
+			peersMux.Lock()
+			for i := range peers {
+				if peers[i].Addr == p.Addr {
+					peers[i].LastSeen = time.Now()
+					peers[i].FailureCount = 0
+					break
+				}
+			}
+			peersMux.Unlock()
+
+			if response == "yes" {
+				metrics.PeerQueriesSuccessful.Add(1)
+				results <- result{addr, nil, false}
+			} else {
+				// "not_found" or unknown — definitive negative, no retry.
+				results <- result{nil, fmt.Errorf("peer doesn't have path"), true}
 			}
 		}(peer)
 	}
 
-	// Wait for first success or all failures
+	// Wait for first success or all peers to respond.
 	notFoundCount := 0
 	failureCount := 0
 	for i := 0; i < len(currentPeers); i++ {
@@ -1570,21 +1600,32 @@ type result struct {
 				log.Printf("[INFO] Found %s at peer %s via parallel query", hash, res.addr.IP.String())
 				return res.addr
 			}
-			// Track not_found responses separately from other failures
 			if res.notFound {
 				notFoundCount++
 			} else {
 				failureCount++
 			}
-			// Fail fast if all peers have responded (either not_found or error)
 			if notFoundCount+failureCount == len(currentPeers) {
-				log.Printf("[INFO] All %d peers responded: %d confirmed not found, %d failed/timeout - failing fast", 
-					len(currentPeers), notFoundCount, failureCount)
+				// Only cache when ALL peers explicitly responded "not_found".
+				// Transport failures (timeouts, connection errors) are not
+				// definitive — the peer may have the path but be temporarily
+				// unreachable.
+				if notFoundCount == len(currentPeers) {
+					negativeCacheMux.Lock()
+					negativeCache[hash] = time.Now().Add(negativeCacheTTL)
+					negativeCacheMux.Unlock()
+					log.Printf("[DEBUG] All %d peers confirmed not_found for %s — cached negative", len(currentPeers), hash)
+				} else {
+					log.Printf("[DEBUG] All %d peers responded for %s: %d not_found, %d failed — not caching (transport failures)", len(currentPeers), hash, notFoundCount, failureCount)
+				}
 				return nil
 			}
 		case <-ctx.Done():
-			log.Printf("[DEBUG] Peer query timeout for hash %s after receiving %d responses (%d not_found, %d failed)", 
-				hash, notFoundCount+failureCount, notFoundCount, failureCount)
+			// Do NOT cache a negative result on timeout — some peers may
+			// not have responded yet, and one of them might have the path.
+			// Only the all-peers-responded branch above is definitive.
+			log.Printf("[DEBUG] Peer query timeout for %s (%d/%d responded, not caching negative)",
+				hash, notFoundCount+failureCount, len(currentPeers))
 			return nil
 		}
 	}
@@ -1960,11 +2001,22 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Track request completion
+	// Track request completion with separate narinfo vs NAR latency.
 	defer func() {
 		duration := time.Since(startTime)
 		metrics.RequestMux.Lock()
 		metrics.RequestTimes = append(metrics.RequestTimes, duration)
+		if isNarInfo {
+			metrics.NarInfoTimes = append(metrics.NarInfoTimes, duration)
+			if len(metrics.NarInfoTimes) > 1000 {
+				metrics.NarInfoTimes = metrics.NarInfoTimes[len(metrics.NarInfoTimes)-1000:]
+			}
+		} else if isNar {
+			metrics.NarTransferTimes = append(metrics.NarTransferTimes, duration)
+			if len(metrics.NarTransferTimes) > 1000 {
+				metrics.NarTransferTimes = metrics.NarTransferTimes[len(metrics.NarTransferTimes)-1000:]
+			}
+		}
 		metrics.RequestMux.Unlock()
 	}()
 
