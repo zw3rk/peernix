@@ -115,9 +115,28 @@ in
         ProtectHome = true;
         ReadWritePaths = [ cfg.dataDir "/nix/store" ];
         
-        # Network restrictions
+        # Network restrictions: allow LAN ranges plus the link-local
+        # broadcast/multicast addresses peernix uses for peer discovery.
+        # Without these, systemd silently drops:
+        #   * UDP to 255.255.255.255 — the limited-broadcast address
+        #     peernix sends discovery announces to (main.go: updatePeersUDP)
+        #   * UDP to 224.0.0.251 / ff02::fb — the IPv4/IPv6 multicast
+        #     addresses hashicorp/mdns uses (main.go: updatePeersMDNS)
+        # Symptom of the bug: the local peer can respond to *incoming*
+        # discovery (replies go back to 10.0.0.x, which is allowed) but
+        # never proactively announces itself, so remote peers only see
+        # this host if they happen to broadcast first.
         IPAddressDeny = "any";
-        IPAddressAllow = [ "localhost" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "fe80::/10" ];
+        IPAddressAllow = [
+          "localhost"
+          "10.0.0.0/8"
+          "172.16.0.0/12"
+          "192.168.0.0/16"
+          "fe80::/10"
+          "255.255.255.255"  # IPv4 limited broadcast (peernix UDP discovery)
+          "224.0.0.251"      # IPv4 mDNS multicast
+          "ff02::fb"         # IPv6 mDNS multicast
+        ];
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
         
         # Resource limits
