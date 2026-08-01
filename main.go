@@ -1693,9 +1693,23 @@ func generateNar(hash string, w io.Writer, compress bool) error {
 type countingWriter struct {
 	http.ResponseWriter
 	bytes int64
+	// committed records that the status line and headers have gone out and can
+	// no longer be changed.  The byte count alone is not enough to tell: the
+	// peer-relay path calls WriteHeader with the peer's status before copying
+	// any body, so a copy that fails immediately leaves bytes == 0 on a
+	// response that is already committed.
+	committed bool
+}
+
+func (cw *countingWriter) WriteHeader(status int) {
+	cw.committed = true
+	cw.ResponseWriter.WriteHeader(status)
 }
 
 func (cw *countingWriter) Write(b []byte) (int, error) {
+	// net/http emits an implicit 200 on the first write, and does so even if
+	// that write then fails, so the response is committed either way.
+	cw.committed = true
 	n, err := cw.ResponseWriter.Write(b)
 	cw.bytes += int64(n)
 	return n, err
@@ -1703,21 +1717,20 @@ func (cw *countingWriter) Write(b []byte) (int, error) {
 
 // failRequest reports a failure that happened while handling a request.
 //
-// If nothing has been written yet the status line is still ours to set, so a
-// normal error response works.  Once any bytes have gone out it is too late:
-// the 200 and the headers are already on the wire, http.Error only produces a
-// "superfluous WriteHeader" warning, and because these responses are chunked
-// Go still finishes the body cleanly on return.  The client then sees a
-// successful 200 carrying a *truncated* payload.  For a NAR that is silent
-// corruption -- worse with Content-Encoding: gzip, where the deferred
-// gzip.Close writes a valid trailer, so the client decompresses without
-// complaint and simply gets a short NAR.
+// While the response is uncommitted the status line is still ours to set, so a
+// normal error response works.  Once it is committed it is too late: the status
+// and headers are already on the wire, http.Error only produces a "superfluous
+// WriteHeader" warning, and because these responses are chunked Go still
+// finishes the body cleanly on return.  The client then sees a successful
+// response carrying a *truncated* payload -- worse with Content-Encoding: gzip,
+// where the deferred gzip.Close writes a valid trailer, so the client
+// decompresses without complaint and simply gets a short NAR.
 //
 // Aborting the handler makes net/http drop the connection without a
 // terminating chunk, so the client sees a broken transfer and can fall back to
 // another substituter instead of trusting a partial store path.
 func failRequest(cw *countingWriter, status int, msg string) {
-	if cw.bytes == 0 {
+	if !cw.committed {
 		http.Error(cw, msg, status)
 		return
 	}
