@@ -1701,6 +1701,29 @@ func (cw *countingWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// failRequest reports a failure that happened while handling a request.
+//
+// If nothing has been written yet the status line is still ours to set, so a
+// normal error response works.  Once any bytes have gone out it is too late:
+// the 200 and the headers are already on the wire, http.Error only produces a
+// "superfluous WriteHeader" warning, and because these responses are chunked
+// Go still finishes the body cleanly on return.  The client then sees a
+// successful 200 carrying a *truncated* payload.  For a NAR that is silent
+// corruption -- worse with Content-Encoding: gzip, where the deferred
+// gzip.Close writes a valid trailer, so the client decompresses without
+// complaint and simply gets a short NAR.
+//
+// Aborting the handler makes net/http drop the connection without a
+// terminating chunk, so the client sees a broken transfer and can fall back to
+// another substituter instead of trusting a partial store path.
+func failRequest(cw *countingWriter, status int, msg string) {
+	if cw.bytes == 0 {
+		http.Error(cw, msg, status)
+		return
+	}
+	panic(http.ErrAbortHandler)
+}
+
 // findPeerForHash handles request deduplication and querying peers.
 // This new function abstracts the logic that was previously inside handleNixCache.
 func findPeerForHash(hash string) *net.UDPAddr {
@@ -2046,7 +2069,7 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 			cw.Header().Set("Content-Type", "text/x-nix-narinfo")
 			if err := generateNarInfo(hash, cw, compress); err != nil {
 				log.Printf("[ERROR] Failed to generate narinfo for %s: %v", hash, err)
-				http.Error(cw, err.Error(), 500)
+				failRequest(cw, 500, err.Error())
 			} else {
 				metrics.FilesSent.Add(1)
 				metrics.BytesSent.Add(uint64(cw.bytes))
@@ -2059,7 +2082,7 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 			}
 			if err := generateNar(hash, cw, compress); err != nil {
 				log.Printf("[ERROR] Failed to generate nar for %s: %v", hash, err)
-				http.Error(cw, err.Error(), 500)
+				failRequest(cw, 500, err.Error())
 			} else {
 				metrics.FilesSent.Add(1)
 				metrics.BytesSent.Add(uint64(cw.bytes))
@@ -2160,7 +2183,11 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	cw.WriteHeader(resp.StatusCode)
 	n, err := io.Copy(cw, resp.Body)
 	if err != nil {
+		// Same hazard as the local-store path: returning here would let Go
+		// finish the chunked body, so the client would accept a truncated
+		// relay as a complete response.
 		log.Printf("[ERROR] Error copying from peer: %v", err)
+		failRequest(cw, 502, "failed to relay from peer")
 	} else {
 		metrics.Hits.Add(1)
 		metrics.FilesReceived.Add(1)
