@@ -1693,12 +1693,53 @@ func generateNar(hash string, w io.Writer, compress bool) error {
 type countingWriter struct {
 	http.ResponseWriter
 	bytes int64
+	// committed records that the status line and headers have gone out and can
+	// no longer be changed.  The byte count alone is not enough to tell: the
+	// peer-relay path calls WriteHeader with the peer's status before copying
+	// any body, so a copy that fails immediately leaves bytes == 0 on a
+	// response that is already committed.
+	committed bool
+}
+
+func (cw *countingWriter) WriteHeader(status int) {
+	cw.committed = true
+	cw.ResponseWriter.WriteHeader(status)
 }
 
 func (cw *countingWriter) Write(b []byte) (int, error) {
+	// net/http emits an implicit 200 on the first write, and does so even if
+	// that write then fails, so the response is committed either way.
+	cw.committed = true
 	n, err := cw.ResponseWriter.Write(b)
 	cw.bytes += int64(n)
 	return n, err
+}
+
+// failRequest reports a failure that happened while handling a request.
+//
+// While the response is uncommitted the status line is still ours to set, so a
+// normal error response works.  Once it is committed it is too late: the status
+// and headers are already on the wire, http.Error only produces a "superfluous
+// WriteHeader" warning, and because these responses are chunked Go still
+// finishes the body cleanly on return.  The client then sees a successful
+// response carrying a *truncated* payload -- worse with Content-Encoding: gzip,
+// where the deferred gzip.Close writes a valid trailer, so the client
+// decompresses without complaint and simply gets a short NAR.
+//
+// Aborting the handler makes net/http drop the connection without a
+// terminating chunk, so the client sees a broken transfer and can fall back to
+// another substituter instead of trusting a partial store path.
+func failRequest(cw *countingWriter, status int, msg string) {
+	if !cw.committed {
+		// The NAR path sets Content-Encoding: gzip before it knows whether the
+		// body can be produced, and http.Error drops Content-Length but not
+		// Content-Encoding -- so without this the client is told to gunzip a
+		// plain-text error and reports a decode failure instead of the reason.
+		cw.Header().Del("Content-Encoding")
+		http.Error(cw, msg, status)
+		return
+	}
+	panic(http.ErrAbortHandler)
 }
 
 // findPeerForHash handles request deduplication and querying peers.
@@ -2046,7 +2087,7 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 			cw.Header().Set("Content-Type", "text/x-nix-narinfo")
 			if err := generateNarInfo(hash, cw, compress); err != nil {
 				log.Printf("[ERROR] Failed to generate narinfo for %s: %v", hash, err)
-				http.Error(cw, err.Error(), 500)
+				failRequest(cw, 500, err.Error())
 			} else {
 				metrics.FilesSent.Add(1)
 				metrics.BytesSent.Add(uint64(cw.bytes))
@@ -2059,7 +2100,7 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 			}
 			if err := generateNar(hash, cw, compress); err != nil {
 				log.Printf("[ERROR] Failed to generate nar for %s: %v", hash, err)
-				http.Error(cw, err.Error(), 500)
+				failRequest(cw, 500, err.Error())
 			} else {
 				metrics.FilesSent.Add(1)
 				metrics.BytesSent.Add(uint64(cw.bytes))
@@ -2160,7 +2201,11 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 	cw.WriteHeader(resp.StatusCode)
 	n, err := io.Copy(cw, resp.Body)
 	if err != nil {
+		// Same hazard as the local-store path: returning here would let Go
+		// finish the chunked body, so the client would accept a truncated
+		// relay as a complete response.
 		log.Printf("[ERROR] Error copying from peer: %v", err)
+		failRequest(cw, 502, "failed to relay from peer")
 	} else {
 		metrics.Hits.Add(1)
 		metrics.FilesReceived.Add(1)
