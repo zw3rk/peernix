@@ -1731,6 +1731,11 @@ func (cw *countingWriter) Write(b []byte) (int, error) {
 // another substituter instead of trusting a partial store path.
 func failRequest(cw *countingWriter, status int, msg string) {
 	if !cw.committed {
+		// The NAR path sets Content-Encoding: gzip before it knows whether the
+		// body can be produced, and http.Error drops Content-Length but not
+		// Content-Encoding -- so without this the client is told to gunzip a
+		// plain-text error and reports a decode failure instead of the reason.
+		cw.Header().Del("Content-Encoding")
 		http.Error(cw, msg, status)
 		return
 	}
