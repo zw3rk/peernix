@@ -1659,7 +1659,12 @@ func initGCRoots() {
 		log.Printf("[WARN] Cannot create %s; NAR responses will not be pinned: %v", dir, err)
 		return
 	}
-	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
+	// A sweep we cannot perform has to be said out loud: any root left behind
+	// by a previous run pins its path forever, and reporting pinning as
+	// enabled while that is true would hide a growing store.
+	if entries, err := os.ReadDir(dir); err != nil {
+		log.Printf("[WARN] Could not read %s to clear stale GC roots; any left by a previous run stay pinned: %v", dir, err)
+	} else if len(entries) > 0 {
 		for _, e := range entries {
 			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
 				log.Printf("[WARN] Could not clear stale GC root %s: %v", e.Name(), err)
@@ -1674,9 +1679,16 @@ func initGCRoots() {
 // pathStillOnDisk reports whether the store path is present right now.  It
 // deliberately stats rather than consulting any cache: it is used to tell a
 // collected path apart from a pin that failed for local reasons.
+//
+// Only a genuine "not there" counts as gone.  Any other stat error (EACCES, a
+// failing disk) says nothing about whether the path was collected, and
+// answering 404 on the strength of it would report a local fault as a cache
+// miss -- so those count as still present and the caller serves unpinned.
 func pathStillOnDisk(fullPath string) bool {
-	_, err := os.Stat(fullPath)
-	return err == nil
+	if _, err := os.Stat(fullPath); err != nil {
+		return !os.IsNotExist(err)
+	}
+	return true
 }
 
 // pinStorePath registers an indirect GC root for fullPath and returns a
@@ -2196,7 +2208,13 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 					// race this pin exists to catch.  404 is what we want the
 					// client to see; it routes around us instead of treating
 					// the whole cache as broken.
-					log.Printf("[WARN] Cannot serve %s, path went away before we could pin it: %v", hash, err)
+					// The hit counted above was optimistic: we are about to
+					// serve nothing, so record it as the miss it turned out
+					// to be rather than inflating the hit rate on exactly
+					// the races this pin exists to surface.
+					metrics.Hits.Add(^uint64(0))
+					metrics.Misses.Add(1)
+					log.Printf("[WARN] Cannot serve %s after all, path went away before we could pin it: %v", hash, err)
 					http.Error(cw, "store path is no longer available", 404)
 					return
 				default:
