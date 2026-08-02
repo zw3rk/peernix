@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -500,6 +501,8 @@ func main() {
 		}
 		log.Printf("[INFO] %s", msg)
 	}
+
+	initGCRoots()
 
 	// Get local IPs to avoid self-pinging
 	localIPs = getLocalIPs()
@@ -1633,6 +1636,109 @@ func queryPeersParallel(hash string) *net.UDPAddr {
 	return nil
 }
 
+// gcRootsDir holds the symlinks that pin a store path for as long as we are
+// streaming it.  It has to sit under the service's data directory: the NixOS
+// unit runs with PrivateTmp, so a root under /tmp would be invisible to the
+// daemon that has to resolve it and would pin nothing at all.  Empty means
+// pinning is unavailable, in which case we serve as before.
+var gcRootsDir string
+
+var gcRootSeq atomic.Uint64
+
+// initGCRoots prepares the pin directory and clears whatever a previous run
+// left behind.  Stale links are not harmless -- each one is a live GC root, so
+// a crash mid-response would otherwise pin that path forever.
+func initGCRoots() {
+	wd, err := os.Getwd()
+	if err != nil {
+		log.Printf("[WARN] Cannot determine working directory; NAR responses will not be pinned: %v", err)
+		return
+	}
+	dir := filepath.Join(wd, "gcroots")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("[WARN] Cannot create %s; NAR responses will not be pinned: %v", dir, err)
+		return
+	}
+	// A sweep we cannot perform has to be said out loud: any root left behind
+	// by a previous run pins its path forever, and reporting pinning as
+	// enabled while that is true would hide a growing store.
+	if entries, err := os.ReadDir(dir); err != nil {
+		log.Printf("[WARN] Could not read %s to clear stale GC roots; any left by a previous run stay pinned: %v", dir, err)
+	} else if len(entries) > 0 {
+		for _, e := range entries {
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+				log.Printf("[WARN] Could not clear stale GC root %s: %v", e.Name(), err)
+			}
+		}
+		log.Printf("[INFO] Cleared %d stale GC root(s) from %s", len(entries), dir)
+	}
+	gcRootsDir = dir
+	log.Printf("[INFO] Pinning served NAR paths against GC via %s", dir)
+}
+
+// pathStillOnDisk reports whether the store path is present right now.  It
+// deliberately stats rather than consulting any cache: it is used to tell a
+// collected path apart from a pin that failed for local reasons.
+//
+// Only a genuine "not there" counts as gone.  Any other stat error (EACCES, a
+// failing disk) says nothing about whether the path was collected, and
+// answering 404 on the strength of it would report a local fault as a cache
+// miss -- so those count as still present and the caller serves unpinned.
+func pathStillOnDisk(fullPath string) bool {
+	if _, err := os.Stat(fullPath); err != nil {
+		return !os.IsNotExist(err)
+	}
+	return true
+}
+
+// pinStorePath registers an indirect GC root for fullPath and returns a
+// function that releases it.
+//
+// Serving a NAR takes no temp root of its own, so nothing tells a collector
+// that the path is in use.  That is how a scheduled nix-collect-garbage on a
+// builder deleted a path out from under an in-flight `nix-store --dump`,
+// leaving the client with a half-written response.
+//
+// It doubles as a liveness check, which is the more valuable half.  When the
+// path has already been collected the pin fails and the caller can answer 404
+// while the response is still uncommitted.  Aborting a committed 200 mid-body
+// makes the client report a partial transfer, and nix reacts by disabling the
+// whole substituter for 60 seconds -- so a single collected path takes out
+// every unrelated fetch in that window.
+func pinStorePath(fullPath string) (release func(), err error) {
+	noop := func() {}
+	if gcRootsDir == "" {
+		return noop, nil
+	}
+	// `--realise` on a .drv would *build* it.  Never do that merely to serve a
+	// NAR; skip the pin and accept the small window instead.
+	if strings.HasSuffix(fullPath, ".drv") {
+		return noop, nil
+	}
+
+	link := filepath.Join(gcRootsDir, fmt.Sprintf("%s.%d", filepath.Base(fullPath), gcRootSeq.Add(1)))
+	// Substituters and builders off: this has to fail fast when the path is
+	// gone, not start fetching it back over the network while a client waits.
+	cmd := exec.Command("nix-store", "--realise", fullPath,
+		"--add-root", link, "--indirect",
+		"--option", "substituters", "",
+		"--option", "builders", "")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Usually there is no link to remove -- nix-store failed before
+		// creating one -- but if there is and we cannot clear it, it pins its
+		// path until the next restart sweeps it.  Worth saying.
+		if rmErr := os.Remove(link); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("[WARN] Could not remove GC root %s after a failed pin; it stays pinned until restart: %v", link, rmErr)
+		}
+		return noop, fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return func() {
+		if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+			log.Printf("[WARN] Could not release GC root %s: %v", link, err)
+		}
+	}, nil
+}
+
 func generateNar(hash string, w io.Writer, compress bool) error {
 	fullPath, found := findStorePath(hash)
 	if !found {
@@ -2093,6 +2199,38 @@ func handleNixCache(w http.ResponseWriter, r *http.Request) {
 				metrics.BytesSent.Add(uint64(cw.bytes))
 			}
 		} else {
+			// Pin the path before committing to a 200.  If it has been
+			// collected since we advertised it, say so now with a 404 the
+			// client can route around, rather than truncating a response it
+			// will read as the whole cache misbehaving.
+			if fullPath, ok := findStorePath(hash); ok {
+				release, err := pinStorePath(fullPath)
+				switch {
+				case err == nil:
+					defer release()
+				case !pathStillOnDisk(fullPath):
+					// Collected between advertising it and now -- exactly the
+					// race this pin exists to catch.  404 is what we want the
+					// client to see; it routes around us instead of treating
+					// the whole cache as broken.
+					// The hit counted above was optimistic: we are about to
+					// serve nothing, so record it as the miss it turned out
+					// to be rather than inflating the hit rate on exactly
+					// the races this pin exists to surface.
+					metrics.Hits.Add(^uint64(0))
+					metrics.Misses.Add(1)
+					log.Printf("[WARN] Cannot serve %s after all, path went away before we could pin it: %v", hash, err)
+					http.Error(cw, "store path is no longer available", 404)
+					return
+				default:
+					// The path is still there, so the pin failed for some
+					// other reason -- fork pressure, a daemon hiccup.  Serve
+					// it unpinned rather than turning a local problem into a
+					// cache miss; failRequest below still stops us returning
+					// a silently truncated body.
+					log.Printf("[WARN] Serving %s unpinned, could not register a GC root: %v", hash, err)
+				}
+			}
 			cw.Header().Set("Content-Type", "application/x-nix-nar")
 			if compress {
 				cw.Header().Set("Content-Encoding", "gzip")
