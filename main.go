@@ -1724,7 +1724,12 @@ func pinStorePath(fullPath string) (release func(), err error) {
 		"--option", "substituters", "",
 		"--option", "builders", "")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		os.Remove(link)
+		// Usually there is no link to remove -- nix-store failed before
+		// creating one -- but if there is and we cannot clear it, it pins its
+		// path until the next restart sweeps it.  Worth saying.
+		if rmErr := os.Remove(link); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("[WARN] Could not remove GC root %s after a failed pin; it stays pinned until restart: %v", link, rmErr)
+		}
 		return noop, fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return func() {
